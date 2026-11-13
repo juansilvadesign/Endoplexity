@@ -119,6 +119,22 @@ async function runChecks(check, skip, filePath) {
 
   // "Referral" is the option whose markup has surrounding whitespace/newlines —
   // choosing it by the clean text proves the trim, not just that select() works.
+  // batch's middle steps: the ack alone and no read. The read after it must
+  // still report the change, which it would not ("nothing") had the quiet
+  // step secretly read the page and moved the delta baseline.
+  await cdp.snapshot();
+  const ack = await cdp.select(select, "LinkedIn", { quiet: true });
+  check("a quiet action returns its ack, not the page", ack === 'selected "LinkedIn"' ? null : `got ${ack.length} chars`);
+  const after = await cdp.snapshot();
+  // Reported, as a delta OR as the whole page. A native select moves three lines
+  // (its value, and `selected` leaving one option for another), and on this
+  // 14-line fixture six changed lines is over delta()'s 40% bar, so the whole
+  // page is the right answer: asserting a delta here failed the first live run
+  // with the code correct. A secret read would give "(nothing" and no new value.
+  check(
+    "the read after a quiet action reports what it changed",
+    after.includes('"Source" = "LinkedIn"') && !after.includes("(nothing") ? null : after.slice(0, 120),
+  );
   snap = await cdp.select(select, "Referral");
 
   if (filePath) {
@@ -310,6 +326,11 @@ async function runChecks(check, skip, filePath) {
     "and a ref from before that re-read still resolves",
     someRef && (await cdp.hover(someRef).then(() => null, (err) => err.message)),
   );
+
+  const seeWas = cdp.getSee();
+  cdp.setSee("off");
+  check("See off: no screenshot is taken", await throws(() => runTool("screenshot"), "See is off"));
+  cdp.setSee(seeWas);
 }
 
 /**

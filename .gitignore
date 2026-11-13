@@ -9,6 +9,7 @@ docs/launch.md
 # setup.mjs writes the launcher here when there is no Startup folder to put it in
 Endoplexity.vbs
 .endo-token
+.endo-jev-key
 .endo-mcp.json
 .endo-files.json
 # The panel's paperclip: the bridge's own map, and the copies it holds.
@@ -17,9 +18,24 @@ Endoplexity.vbs
 *.log
 # Raw event streams from `npm run bench` — a measurement's evidence, not source.
 *.jsonl
+# ...except a captured stream a test is written against, which is source.
+!bridge/test/fixtures/*.jsonl
 dist/
 
 # The raw screen recording — 300MB+, and the edited asset is what ships.
 demoVid.mp4
 *.mp4
 !docs/demo.mp4
+!docs/endoplexity.mp4
+
+# The README film's HyperFrames project: local only. Its fonts are this
+# machine's Segoe UI and its sound effects are Pixabay files, neither of
+# which may be redistributed on their own; the rendered film is what ships.
+video/
+
+# Phase 23's raw evidence (streams, end pages, screenshots, judge packets)
+# ships as a release asset; the summaries, verdicts and results are committed.
+bench/runs/**/*.final.txt
+bench/runs/**/*.jpg
+bench/runs/smoke/
+bench/judge/packets/

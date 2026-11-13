@@ -14,7 +14,7 @@
 //
 // Requires Chrome 125+, where chrome.debugger.sendCommand accepts a sessionId.
 
-import { delta, serialize } from "./ax.js";
+import { delta, labelOf as lineLabel, serialize } from "./ax.js";
 
 const MAIN = ""; // the tab's own session — sendCommand target with no sessionId
 
@@ -29,9 +29,12 @@ const send = (sessionId, method, params = {}) =>
 
 function reset() {
   tabId = null;
+  mainDoc = null;
   sessions = new Map();
   refs = new Map();
   frameSeq = 0;
+  inflight.clear();
+  netLog = [];
 }
 
 // Bumped without clearing refs, so a ref minted before the page moved is still
@@ -51,6 +54,20 @@ function invalidate(why) {
 const GONE = /session with given id|target closed/i;
 const dropIfDead = (sessionId, err) => sessionId !== MAIN && GONE.test(err.message) && sessions.delete(sessionId);
 
+/**
+ * The main frame's document now (its loaderId). A frame session belongs to the
+ * document that was current when it attached, and leaving a page does not end
+ * its frames at once: Chrome detaches them when it gets round to it. Until
+ * then every read listed them. Measured 2026-11-02: example.com read right
+ * after stackoverflow.com came back 1,902 characters, its own page being 25,
+ * the rest ad frames of the page it had left; the same dead sessions are the
+ * P17 timeout on leaving that site. Not deleted on navigation: going back
+ * restores a cached page with its frames still attached, under its old
+ * loaderId, and they count again.
+ */
+let mainDoc = null;
+const current = () => [...sessions].filter(([id, frame]) => id === MAIN || frame.doc === mainDoc);
+
 function setupSession(sessionId) {
   // Nested OOPIFs: each new session needs its own auto-attach or a frame two
   // levels deep never attaches.
@@ -64,10 +81,16 @@ function setupSession(sessionId) {
     flatten: true,
   }).catch((err) => console.warn(`endo: setAutoAttach failed on ${sessionId || "main"}`, err));
   send(sessionId, "Page.enable").catch(() => {});
+  // A new tab is a new debugger attachment: Network starts disabled again.
+  if (sessionId === MAIN && settleState !== "off") send(MAIN, "Network.enable").catch(() => {});
 }
 
 function onEvent(source, method, params) {
   if (source.tabId !== tabId) return;
+
+  // Settle's network half: main-frame session only. A frame's own traffic is its
+  // business and a chatty ad iframe would hold the page "busy" forever.
+  if (settleState !== "off" && !source.sessionId && method.startsWith("Network.")) trackNet(method, params);
 
   if (method === "Target.attachedToTarget") {
     const { sessionId, targetInfo } = params;
@@ -75,7 +98,7 @@ function onEvent(source, method, params) {
     // accessibility tree, so registering them would put a permanent
     // "(frame unavailable)" line in every snapshot of any real site.
     if (targetInfo.type !== "iframe") return;
-    sessions.set(sessionId, { tag: `f${++frameSeq}`, url: targetInfo.url });
+    sessions.set(sessionId, { tag: `f${++frameSeq}`, url: targetInfo.url, doc: mainDoc });
     console.log(`endo: frame f${frameSeq} attached — ${targetInfo.url}`);
     setupSession(sessionId);
   }
@@ -92,12 +115,28 @@ function onEvent(source, method, params) {
     const frame = sessions.get(source.sessionId ?? MAIN);
     if (frame) frame.url = params.frame.url;
     invalidate("navigation");
+    if (!source.sessionId) {
+      inflight.clear();
+      mainDoc = params.frame.loaderId ?? null;
+    }
   }
 }
 
 // chrome://, the web store and other extensions are closed to chrome.debugger AND
 // to tabs.update, so a tab showing one is a dead end, not a starting point.
 const DRIVABLE = /^(https?|file):/;
+
+/*
+ * Parallel runs (Phase 21). The panel loads one copy of this module per lane
+ * (`cdp.js?lane=<id>`), so each lane has its own tab, refs and frames, and
+ * tells each copy which tabs the other lanes hold. A second attach to a held
+ * tab would take it from the lane driving it: attach() releases an attachment
+ * of ours it finds there, by design, for the panel's own remounts.
+ */
+let taken = () => false;
+/** The panel's answer to "is this tab another lane's?". */
+export const setTaken = (fn) => void (taken = fn);
+const busyTab = (id) => new Error(`tab ${id} is being driven by another run in this panel`);
 
 /**
  * The tab to drive when nobody named one.
@@ -107,8 +146,15 @@ const DRIVABLE = /^(https?|file):/;
  * with "Cannot access a chrome:// URL" and cannot even be navigated away from.
  * Fall back to another drivable tab in the window, and open one if there is none.
  */
-const findDrivable = (tabs) =>
-  tabs.find((t) => t.active && DRIVABLE.test(t.url ?? "")) ?? tabs.find((t) => DRIVABLE.test(t.url ?? ""));
+//
+// When another lane is driving the tab in front, nothing here is this lane's
+// to take: not that tab, and not some other tab of yours it was never pointed
+// at. The caller opens a tab of its own instead.
+const findDrivable = (tabs) => {
+  if (tabs.some((t) => t.active && taken(t.id))) return undefined;
+  const free = tabs.filter((t) => !taken(t.id));
+  return free.find((t) => t.active && DRIVABLE.test(t.url ?? "")) ?? free.find((t) => DRIVABLE.test(t.url ?? ""));
+};
 
 async function pickTab(open) {
   const usable = findDrivable(await chrome.tabs.query({ currentWindow: true }));
@@ -122,7 +168,20 @@ async function pickTab(open) {
   if (!open) return null;
   // No wait: about:blank is already loaded, and navigate() waits for its own.
   const opened = await chrome.tabs.create({ url: "about:blank", active: true });
+  // Opened by the run, so it is the run's: rule 3 on joinGroup().
+  await joinGroup(opened.id);
   return opened.id;
+}
+
+/**
+ * A run that must not take the tab in front gets one of its own, in the
+ * background and in its group: a scheduled run (scripts/run-task.ts) starts
+ * while you may be working, and is never handed the page you are on.
+ */
+export async function attachOwn() {
+  const opened = await chrome.tabs.create({ url: "about:blank", active: false });
+  await joinGroup(opened.id);
+  return attach(opened.id);
 }
 
 /**
@@ -155,12 +214,36 @@ export async function attach(target, { open = true } = {}) {
     if (!open) return null;
     throw new Error("no tab to drive");
   }
+  if (taken(id)) throw busyTab(id);
 
-  await chrome.debugger.attach({ tabId: id }, "1.3");
+  try {
+    await chrome.debugger.attach({ tabId: id }, "1.3");
+  } catch (err) {
+    // An attachment belongs to the extension, not to this document: one made by
+    // a panel Chrome has since torn down (every window switch) outlives it and
+    // refuses this one, so a remount mid-task, or use_tab back to a tab driven
+    // before it, failed with "Another debugger is already attached" (seen live,
+    // P17). That one is ours to release. DevTools' is not, and detaching it
+    // fails, so the original error stands.
+    if (!/already attached/i.test(err.message)) throw err;
+    await chrome.debugger.detach({ tabId: id }).catch(() => {
+      throw err;
+    });
+    await chrome.debugger.attach({ tabId: id }, "1.3");
+  }
   tabId = id;
   sessions.set(MAIN, { tag: "f0", url: "" });
   invalidate("attached");
+  // Before auto-attach, so the page's frames attach under the document they
+  // belong to rather than under none.
+  mainDoc = (await send(MAIN, "Page.getFrameTree").catch(() => null))?.frameTree?.frame?.loaderId ?? null;
   setupSession(MAIN);
+  // A covered or minimized window makes the page `hidden`: it stops making
+  // frames, every mouse event waits ~5 s for one, and a hover can land after
+  // the read meant to show it (a user's self-test, behind a maximized DevTools
+  // window). Focus emulation keeps the driven page visible, as Playwright does
+  // for every page it drives. Measured: hover 5.4 s -> 0.38 s.
+  await send(MAIN, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
 
   const tab = await chrome.tabs.get(id);
   console.log(`endo: attached to tab ${id} — ${tab.url}`);
@@ -200,6 +283,29 @@ export async function navigate(url) {
   await ready;
   console.log(`endo: navigated to ${url}`);
   return `navigated to ${url}`;
+}
+
+/**
+ * A page that loaded and reads as nothing. Measured 2026-11-02: stackoverflow
+ * in a fresh profile is Cloudflare's "Just a moment..." check first, an empty
+ * accessibility tree that reloads itself once and only then navigates to the
+ * real page, ~2.8 s in all, and navigate handed the model the empty string.
+ * Waiting for one more load caught the check's own reload, so this waits for
+ * the page to read as something. Each read forgets the last: the model has
+ * seen none of them, so a patch against an empty one would describe nothing it
+ * holds. Failing that, the result says what the tab says instead of nothing.
+ * ponytail: navigate only, where it was seen; a click into one would want it too.
+ */
+export async function emptyPage(options) {
+  for (const t0 = Date.now(); Date.now() - t0 < 8_000; ) {
+    await new Promise((r) => setTimeout(r, 500));
+    forget();
+    const again = await snapshot(options);
+    if (again.trim()) return again;
+  }
+  // Collapsed: a title is the page's text, and a newline in it could forge a line.
+  const title = String((await chrome.tabs.get(tabId)).title ?? "").replace(/\s+/g, " ").trim();
+  return `(the page "${title}" has nothing to read yet: a browser check or a redirect may still be running. Read it again with snapshot.)`;
 }
 
 /**
@@ -300,7 +406,9 @@ export async function drivable() {
 export async function tabs() {
   const open = await drivable();
   if (!open.length) return "no drivable tabs open";
-  return open.map((t) => `${t.id === tabId ? "*" : " "} id ${t.id} — "${t.title ?? ""}" ${t.url}`).join("\n");
+  return open
+    .map((t) => `${t.id === tabId ? "*" : " "} id ${t.id} — "${t.title ?? ""}" ${t.url}${t.id !== tabId && taken(t.id) ? " (another run is driving this tab)" : ""}`)
+    .join("\n");
 }
 
 /**
@@ -312,6 +420,10 @@ export async function tabs() {
  * switching is detach-then-attach — which throws away every ref, deliberately:
  * they belong to the old tab's renderer and would resolve to nothing here.
  */
+// A scheduled run must not pull its tabs to the front (scripts/run-task.ts).
+let background = false;
+export const setBackground = (on) => void (background = !!on);
+
 export async function useTab(id, url, options) {
   requireAttached();
   const undrivable = (where) =>
@@ -326,7 +438,8 @@ export async function useTab(id, url, options) {
   // the real one in pendingUrl until the navigation commits, so reading .url
   // there rejects every new tab as undrivable.
   if (url && !DRIVABLE.test(url)) throw undrivable(url);
-  const target = url ? (await chrome.tabs.create({ url, active: true })).id : id;
+  if (!url && taken(id)) throw busyTab(id);
+  const target = url ? (await chrome.tabs.create({ url, active: !background })).id : id;
   if (target == null) throw new Error("use_tab needs an id from tabs(), or a url to open");
   // Only a tab we just opened — see the rules on joinGroup().
   if (url) await joinGroup(target);
@@ -338,7 +451,7 @@ export async function useTab(id, url, options) {
   if (target !== tabId) {
     await detach();
     await attach(target);
-    await chrome.tabs.update(target, { active: true });
+    if (!background) await chrome.tabs.update(target, { active: true });
   }
   // A freshly created tab is usually still loading; settle() waits on exactly
   // that and needs no separate path.
@@ -348,6 +461,165 @@ export async function useTab(id, url, options) {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/*
+ * Settle: "the page stopped changing", measured instead of guessed.
+ *
+ * State is "off" (the fixed wait below, untouched: no Network.enable, no
+ * evaluate), "shadow" (same timing as off, but measured alongside so the bridge
+ * can log how often the guess would have been right) or "act" (wait for quiet).
+ * Quiet means no DOM mutation and no main-frame request in flight for QUIET_MS.
+ */
+let settleState = "off";
+let onSettleFn = null;
+const inflight = new Set(); // main-frame requestIds not yet finished
+let netLog = []; // [{ t, kind }] for settledAt(); only kept while not off
+let lastNetT = 0;
+const QUIET_MS = 100;
+// WebSocket and EventSource are long-lived by design: never "idle". Document is
+// left to settle()'s own `loading` check: a cross-site iframe's document request
+// is reported starting on the main session and finishing only on the frame's own
+// (measured in headless Chrome on the OOPIF fixture), so counting it held every
+// page with such an iframe "busy" forever.
+const NO_NET = /^(WebSocket|EventSource|Document)$/;
+
+export const onSettle = (fn) => void (onSettleFn = fn);
+
+export function setSettle(state) {
+  const next = state === "shadow" || state === "act" ? state : "off";
+  const was = settleState;
+  settleState = next;
+  if (tabId === null || (was === "off") === (next === "off")) return;
+  send(MAIN, next === "off" ? "Network.disable" : "Network.enable").catch(() => {});
+  inflight.clear();
+  netLog = [];
+}
+
+function trackNet(method, params) {
+  const t = Date.now();
+  let kind;
+  if (method === "Network.requestWillBeSent" && !NO_NET.test(params.type ?? "")) {
+    inflight.add(params.requestId);
+    kind = "net-start";
+  } else if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
+    // Only ids we counted: a WebSocket's end must not read as a request ending.
+    if (!inflight.delete(params.requestId)) return;
+    kind = "net-end";
+  } else return;
+  lastNetT = t;
+  netLog.push({ t, kind });
+  if (netLog.length > 500) netLog.shift();
+}
+
+// Runs in the page. One observer, parked on a page-global under a name nothing
+// else uses; the array is capped so a page that mutates constantly costs memory
+// for 200 numbers, not a leak. Idempotent: a second call finds the first.
+const OBSERVE = `(() => {
+  const w = window;
+  if (!w.__endoSettle) {
+    const log = [];
+    const mo = new MutationObserver(() => { log.push(Date.now()); if (log.length > 200) log.shift(); });
+    mo.observe(document, { subtree: true, childList: true, characterData: true, attributes: true,
+      attributeFilter: ["aria-expanded", "aria-hidden", "aria-checked", "aria-selected", "aria-disabled", "disabled", "hidden", "open", "value", "checked"] });
+    w.__endoSettle = { log, mo };
+  }
+  return true;
+})()`;
+const LAST = "(window.__endoSettle?.log.at(-1) ?? 0)";
+// null, not [], when the observer is gone: the click navigated and this is a
+// new document, which says nothing about whether the old one went quiet.
+const COLLECT = `(() => {
+  const s = window.__endoSettle;
+  if (!s) return null;
+  s.mo.disconnect();
+  delete window.__endoSettle;
+  return s.log;
+})()`;
+
+async function evalMain(expression) {
+  const { result, exceptionDetails } = await send(MAIN, "Runtime.evaluate", { expression, returnByValue: true });
+  if (exceptionDetails) throw new Error(exceptionDetails.exception?.description ?? exceptionDetails.text);
+  return result.value;
+}
+
+/**
+ * The earliest time T in [t0 + quietMs, until] with no event in (T - quietMs, T]
+ * and no request in flight at T, or null. Events are { t, kind: "dom" | "net-start"
+ * | "net-end" }; a request already open at t0 is a "net-start" at t0.
+ *
+ * The only T worth testing are t0 + quietMs and each event's t + quietMs: between
+ * those the window cannot become quieter, so the earliest quiet T is one of them.
+ */
+export function settledAt(t0, events, quietMs, until) {
+  const candidates = [t0 + quietMs, ...events.map((e) => e.t + quietMs)].filter((T) => T >= t0 + quietMs && T <= until);
+  for (const T of candidates.sort((a, b) => a - b)) {
+    let open = 0;
+    let busy = false;
+    for (const e of events) {
+      if (e.t <= T && e.t > T - quietMs) busy = true;
+      if (e.t <= T) open += e.kind === "net-start" ? 1 : e.kind === "net-end" ? -1 : 0;
+    }
+    if (!busy && open <= 0) return T;
+  }
+  return null;
+}
+
+/** Did the page change (a DOM event) after T, up to `until`? Null T: nothing settled. */
+export const changedAfter = (T, events, until) =>
+  T !== null && events.some((e) => e.kind === "dom" && e.t > T && e.t <= until);
+
+// Shadow: the fixed wait stays exactly as it was; the measurement rides inside it.
+async function shadowSettle() {
+  let start;
+  try {
+    await evalMain(OBSERVE);
+    start = Date.now();
+  } catch {
+    return sleep(300); // measurement failed: behave as "off", report nothing
+  }
+  const open = [...inflight];
+  netLog = [];
+  await sleep(300);
+  try {
+    const dom = await evalMain(COLLECT);
+    // A navigation logged as "settled, nothing changed" would count as agreement.
+    if (dom === null) return;
+    const events = [
+      ...open.map(() => ({ t: start, kind: "net-start" })),
+      ...netLog.filter((e) => e.t >= start),
+      ...dom.map((t) => ({ t, kind: "dom" })),
+    ];
+    const until = start + 300;
+    const T = settledAt(start, events, QUIET_MS, until);
+    onSettleFn?.({ settledAt: T === null ? null : T - start, changedAfter: changedAfter(T, events, until), waited: 300 });
+  } catch {
+    // Navigation destroyed the context, or the evaluate threw: no report. Never the action's problem.
+  }
+}
+
+async function actSettle() {
+  const t0 = Date.now();
+  try {
+    await evalMain(OBSERVE);
+    // ponytail: 1000ms is the knob. Long enough for a React re-render or a fetch
+    // that fires on click, short enough that a page with a chatty poll (which
+    // never goes quiet) costs 700ms more than today's wait, not a hang.
+    for (;;) {
+      const now = Date.now();
+      const last = await evalMain(LAST);
+      if (inflight.size === 0 && now - Math.max(last, lastNetT, t0) >= QUIET_MS) break;
+      if (now - t0 >= 1000) break;
+      await sleep(25);
+    }
+    // The observer and network tracking watch the main frame only, so with a
+    // frame attached an action inside it looks quiet at once: keep the old wait.
+    if (current().length > 1) await sleep(Math.max(0, 300 - (Date.now() - t0)));
+    await evalMain(COLLECT);
+  } catch {
+    // Context gone or evaluate refused: the rest of the fixed wait, as if off.
+    await sleep(Math.max(0, 300 - (Date.now() - t0)));
+  }
+}
 
 /**
  * Let the page finish reacting before it gets read.
@@ -359,9 +631,24 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * own 30s deadline in the relay that a hang here would burn.
  */
 async function settle() {
-  await sleep(300);
+  if (settleState === "act") await actSettle();
+  else if (settleState === "shadow") await shadowSettle();
+  else await sleep(300);
   const tab = await chrome.tabs.get(tabId);
   if (tab.status === "loading") await loaded(tabId, 10_000);
+}
+
+/**
+ * The end of every action: settle, then hand back the page it produced.
+ *
+ * `quiet` is batch's middle steps (bridge/src/mcp.ts). They still settle, so
+ * the next step meets a page that has reacted, but they must NOT read it:
+ * every read moves sinceLast()'s baseline, and a read the model never sees
+ * would make the batch's final delta silently omit whatever changed during it.
+ */
+async function after(options, ack = "done") {
+  await settle();
+  return options?.quiet ? ack : snapshot(options);
 }
 
 export async function detach() {
@@ -390,10 +677,14 @@ export async function snapshot(options) {
   // a detached frame, a new attachment — which are the events that really do
   // end a ref's meaning.
   const gen = generation;
-  refs = new Map();
+  // A peek is the gate's own read (bridge/src/mcp.ts): the whole page, uncut,
+  // so a Submit outside the model's window still counts. It is nobody's view,
+  // so it moves neither the refs the model holds nor sinceLast()'s baseline.
+  const peek = options?.peek === true;
+  const minted = new Map();
 
   const out = [];
-  for (const [sessionId, frame] of sessions) {
+  for (const [sessionId, frame] of current()) {
     // A frame that auto-attached before it had navigated was recorded with an
     // empty URL, and Page.frameNavigated cannot repair it: inside an OOPIF's own
     // session that event still carries a parentId, so the handler above skips it.
@@ -408,9 +699,9 @@ export async function snapshot(options) {
     try {
       await send(sessionId, "Accessibility.enable");
       const { nodes } = await send(sessionId, "Accessibility.getFullAXTree");
-      const { text, refs: frameRefs } = serialize(nodes, frame.tag, options);
+      const { text, refs: frameRefs } = serialize(nodes, frame.tag, peek ? { maxLines: Infinity } : options);
       for (const [ref, backendNodeId] of frameRefs) {
-        refs.set(ref, { sessionId, backendNodeId, generation: gen });
+        minted.set(ref, { sessionId, backendNodeId, generation: gen });
       }
       out.push(text);
     } catch (err) {
@@ -421,11 +712,24 @@ export async function snapshot(options) {
       else out.push(`(frame ${frame.tag} unavailable: ${err.message})`);
     }
   }
+  if (peek) return out.join("\n");
+  // Points are not in the AX tree, so a re-read must not drop them.
+  for (const [ref, hit] of refs) if (hit.point) minted.set(ref, hit);
+  refs = minted;
   return sinceLast(out.join("\n"), gen);
 }
 
 /** The page as the model was last shown it, so an unchanged one is not re-sent. */
 let shown = { generation: -1, text: "", run: 0 };
+
+/**
+ * Make the next read a full page. The bridge calls this when claude's reader
+ * subagent starts and when it hands back: the two share `shown` but not their
+ * contexts, so a delta against the other's read describes a page never read.
+ */
+export function forget() {
+  shown = { generation: -1, text: "", run: 0 };
+}
 
 /**
  * How many deltas may follow one full page.
@@ -462,9 +766,116 @@ function resolve(ref) {
   return hit;
 }
 
+/**
+ * What a ref is right now, read fresh from that one node, for the gate
+ * (bridge/src/mcp.ts readFor): a click is decided on the element it is about to
+ * land on, not on the page the model read some steps ago. Throws "stale ref" /
+ * "unknown ref" like every action, which the bridge reads as "nothing to weigh".
+ */
+export async function labelOf(ref) {
+  const hit = resolve(ref);
+  if (hit.point) return pointLabel(hit);
+  const { sessionId, backendNodeId } = hit;
+  await send(sessionId, "Accessibility.enable");
+  const { nodes } = await send(sessionId, "Accessibility.getPartialAXTree", { backendNodeId, fetchRelatives: false });
+  const node = nodes.find((n) => n.backendDOMNodeId === backendNodeId) ?? nodes[0];
+  if (!node) throw new Error(`no accessibility node for ${ref}`);
+  return lineLabel(node);
+}
+
+// See: where `find` said something is, as a viewport position (CSS px) rather
+// than a node. The counter never repeats, so a point from an earlier page can
+// only read as stale, never as a different point.
+let seeState = "off";
+let pointSeq = 0;
+
+export const setSee = (state) => void (seeState = state === "act" ? "act" : "off");
+export const getSee = () => seeState;
+
+/** Pixel size of a JPEG, read from its SOF marker. */
+export function jpegSize(bytes) {
+  for (let i = 2; i + 9 < bytes.length; ) {
+    if (bytes[i] !== 0xff) { i++; continue; }
+    const m = bytes[i + 1];
+    if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+      return { height: (bytes[i + 5] << 8) | bytes[i + 6], width: (bytes[i + 7] << 8) | bytes[i + 8] };
+    }
+    i += m === 0xd8 || m === 0x01 || (m >= 0xd0 && m <= 0xd7) ? 2 : 2 + ((bytes[i + 2] << 8) | bytes[i + 3]);
+  }
+  throw new Error("screenshot is not a readable JPEG");
+}
+
+/** The viewport's own screenshot, for Jev. Refuses unless See is on: the panel's check, not the bridge's. */
+export async function screenshot() {
+  if (seeState !== "act") throw new Error("See is off: no screenshot taken");
+  requireAttached();
+  const { cssVisualViewport: v } = await send(MAIN, "Page.getLayoutMetrics");
+  // Clipped to the viewport the point is mapped in: unclipped, the image also
+  // holds the scrollbar strip, and a box's fraction of it lands up to 15 px
+  // left of the thing at the right edge (measured: 2534 px wide against 2504).
+  const clip = { x: v.pageX, y: v.pageY, width: v.clientWidth, height: v.clientHeight, scale: 1 };
+  let { data } = await send(MAIN, "Page.captureScreenshot", { format: "jpeg", quality: 80, clip });
+  let bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+  let { width, height } = jpegSize(bytes);
+  // Jev takes 256..1568 px a side; a hidpi viewport can exceed it.
+  const scale = Math.min(1, 1568 / Math.max(width, height));
+  if (scale < 1) {
+    width = Math.round(width * scale);
+    height = Math.round(height * scale);
+    const canvas = new OffscreenCanvas(width, height);
+    canvas.getContext("2d").drawImage(await createImageBitmap(new Blob([bytes])), 0, 0, width, height);
+    bytes = new Uint8Array(await (await canvas.convertToBlob({ type: "image/jpeg", quality: 0.8 })).arrayBuffer());
+    data = btoa(bytes.reduce((s, b) => s + String.fromCharCode(b), ""));
+  }
+  console.log(`endo: screenshot ${width}x${height}`);
+  return { data, width, height, viewport: { width: v.clientWidth, height: v.clientHeight } };
+}
+
+/** Mint a point ref at a viewport position. Clickable and hoverable, nothing else. */
+export async function point(x, y, query) {
+  requireAttached();
+  const { cssLayoutViewport: v } = await send(MAIN, "Page.getLayoutMetrics");
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= v.clientWidth || y >= v.clientHeight) {
+    throw new Error(`point ${x},${y} is outside the ${v.clientWidth}x${v.clientHeight} viewport`);
+  }
+  const ref = `@p${++pointSeq}`;
+  refs.set(ref, { point: { x, y }, query: String(query ?? "").trim().slice(0, 200), sessionId: MAIN, generation });
+  return ref;
+}
+
+const ACTIONABLE = /^(button|link|menuitem\w*|checkbox|radio|switch|tab|option|combobox|textbox|searchbox)$/;
+
+/**
+ * What is really under a point, for the gate: the node there plus its ancestors
+ * up to the nearest actionable one, because a click on the <svg> inside
+ * <button aria-label="Place order"> lands on the button. Throws on any failure or
+ * when nothing in the chain has a name: the bridge reads a throw as "ask the
+ * human", and the model's own query text is never what the gate decides on.
+ */
+async function pointLabel({ point: { x, y }, query }) {
+  await send(MAIN, "DOM.getDocument", { depth: 0 });
+  const { backendNodeId } = await send(MAIN, "DOM.getNodeForLocation", { x: Math.floor(x), y: Math.floor(y), includeUserAgentShadowDOM: true });
+  await send(MAIN, "Accessibility.enable");
+  const { nodes } = await send(MAIN, "Accessibility.getPartialAXTree", { backendNodeId, fetchRelatives: true });
+  const byId = new Map(nodes.map((n) => [n.nodeId, n]));
+  const chain = [];
+  for (let n = nodes.find((n) => n.backendDOMNodeId === backendNodeId); n && chain.length < 20; n = byId.get(n.parentId)) {
+    chain.push(n);
+    if (ACTIONABLE.test(n.role?.value ?? "")) break;
+  }
+  if (!chain.some((n) => n.name?.value)) throw new Error("nothing readable under that point");
+  return `[point] "${query}" over ${chain.map(lineLabel).join(" in ")}`;
+}
+
+const noPoint = (ref) => {
+  throw new Error(`${ref} is a point on the screen: only click and hover take it`);
+};
+
 /** Centre of a ref in its own frame's coordinates, scrolled into view first. */
 async function centreOf(ref) {
-  const { sessionId, backendNodeId } = resolve(ref);
+  const hit = resolve(ref);
+  if (hit.point) return hit.point;
+  const { sessionId, backendNodeId } = hit;
   await send(sessionId, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
   const { model } = await send(sessionId, "DOM.getBoxModel", { backendNodeId });
   const [x1, y1, x2, y2, x3, y3, x4, y4] = model.content;
@@ -491,6 +902,8 @@ async function centreOf(ref) {
  * not just the snapshot. Phase 2 spent six of them on one search.
  */
 export async function click(ref, options) {
+  // ponytail: a point inside a cross-site iframe is dispatched on MAIN, which
+  // never reaches an OOPIF (above). Upgrade: hit-test the frame, re-dispatch there.
   const { sessionId } = resolve(ref);
   const { x, y } = await centreOf(ref);
   const base = { x, y, button: "left", clickCount: 1 };
@@ -498,8 +911,7 @@ export async function click(ref, options) {
   await send(sessionId, "Input.dispatchMouseEvent", { ...base, type: "mousePressed", buttons: 1 });
   await send(sessionId, "Input.dispatchMouseEvent", { ...base, type: "mouseReleased", buttons: 0 });
   console.log(`endo: click ${ref} at ${Math.round(x)},${Math.round(y)}`);
-  await settle();
-  return snapshot(options);
+  return after(options);
 }
 
 /**
@@ -515,8 +927,7 @@ export async function hover(ref, options) {
   const { x, y } = await centreOf(ref);
   await send(sessionId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: 0 });
   console.log(`endo: hover ${ref} at ${Math.round(x)},${Math.round(y)}`);
-  await settle();
-  return snapshot(options);
+  return after(options);
 }
 
 /**
@@ -534,10 +945,11 @@ export async function hover(ref, options) {
  */
 export async function scroll(direction = "down", ref, options) {
   requireAttached();
+  if (ref && resolve(ref).point) noPoint(ref);
   const sessionId = ref ? resolve(ref).sessionId : MAIN;
   // The frame's own viewport when a ref names one — an OOPIF's metrics are its
   // own, so a wheel inside it must be aimed and sized in that space.
-  const { cssLayoutViewport: view } = await send(sessionId, "Page.getLayoutMetrics");
+  const { cssLayoutViewport: view, cssVisualViewport: from, cssContentSize: size } = await send(sessionId, "Page.getLayoutMetrics");
   const at = ref ? await centreOf(ref) : { x: view.clientWidth / 2, y: view.clientHeight / 2 };
   // Just under a screenful, the way Page Down behaves: a full one can step over
   // a lazy-load trigger, and the overlap keeps the model oriented between reads.
@@ -552,8 +964,16 @@ export async function scroll(direction = "down", ref, options) {
     buttons: 0,
   });
   console.log(`endo: scroll ${direction} ${deltaY}px at ${Math.round(at.x)},${Math.round(at.y)}`);
-  await settle();
-  return snapshot(options);
+  // The scroll lands on the compositor's next frame, not when the event is
+  // acked: ~0.1 s normally, ~1 s in a minimized window, which draws one frame a
+  // second (measured). Waited out by the document's offset so the read after
+  // sees what the scroll loaded. Not at the edge already: nothing would move.
+  // ponytail: the document only; a ref-scoped scroll is not waited for.
+  const edge = deltaY > 0 ? size.height - from.pageY - from.clientHeight < 1 : from.pageY < 1;
+  for (const t0 = Date.now(); !ref && !edge && Date.now() - t0 < 1500; await sleep(50)) {
+    if ((await send(MAIN, "Page.getLayoutMetrics")).cssVisualViewport.pageY !== from.pageY) break;
+  }
+  return after(options);
 }
 
 /**
@@ -561,11 +981,19 @@ export async function scroll(direction = "down", ref, options) {
  * every autocomplete widget that listens for keydown actually fire.
  */
 export async function type(ref, text) {
+  if (resolve(ref).point) noPoint(ref);
   const { sessionId, backendNodeId } = resolve(ref);
   await send(sessionId, "DOM.focus", { backendNodeId });
   // ponytail: per-char, no batching. Design doc's ceiling is ~200 chars before
   // Input.insertText is worth it; nothing typed into a form field is near that.
-  for (const ch of text) {
+  // A line break as a key event is Enter, which submits a form with no gate
+  // (type is never gated). insertText puts a newline in a <textarea> and an
+  // <input> drops it, so nothing submits. "\r\n" counts as one break.
+  for (const ch of text.replace(/\r\n|\r/g, "\n")) {
+    if (ch === "\n") {
+      await send(MAIN, "Input.insertText", { text: "\n" });
+      continue;
+    }
     // Alphanumerics carry their US-layout key code, which is what handlers that
     // sniff event.keyCode expect. Everything else goes through as text only —
     // a full layout table is not worth 200 lines here.
@@ -595,8 +1023,7 @@ export async function key(name, options) {
   await send(MAIN, "Input.dispatchKeyEvent", { ...rest, text, type: "keyDown" });
   await send(MAIN, "Input.dispatchKeyEvent", { ...rest, type: "keyUp" });
   console.log(`endo: key ${name}`);
-  await settle();
-  return snapshot(options);
+  return after(options);
 }
 
 /**
@@ -612,7 +1039,7 @@ export async function key(name, options) {
 export async function upload(path, match, options) {
   requireAttached();
   const hits = [];
-  for (const [sessionId, frame] of sessions) {
+  for (const [sessionId, frame] of current()) {
     try {
       const { root } = await send(sessionId, "DOM.getDocument", { depth: 0 });
       const { nodeIds } = await send(sessionId, "DOM.querySelectorAll", {
@@ -623,7 +1050,11 @@ export async function upload(path, match, options) {
         const { attributes } = await send(sessionId, "DOM.getAttributes", { nodeId });
         const attrs = {};
         for (let i = 0; i < attributes.length; i += 2) attrs[attributes[i]] = attributes[i + 1];
-        hits.push({ sessionId, nodeId, label: attrs["aria-label"] ?? attrs.name ?? attrs.id ?? attrs.accept ?? "(unlabelled)" });
+        // Whitespace collapsed: the label is the page's text and lands in the
+        // result's first line, and one carrying a newline could forge a line the
+        // bridge parses as page (the delta marker, a ref) in front of the real one.
+        const label = String(attrs["aria-label"] ?? attrs.name ?? attrs.id ?? attrs.accept ?? "(unlabelled)").replace(/\s+/g, " ").trim();
+        hits.push({ sessionId, nodeId, label });
       }
     } catch (err) {
       // Frames come and go; one dead frame must not kill the whole operation.
@@ -657,7 +1088,8 @@ export async function upload(path, match, options) {
   // Measured 2026-08-04. Without this line the agent reads its own success as a
   // failure and retries — the trap the whole "actions return the page" design
   // already walked into once.
-  let prefix = `set "${path}" on file input "${chosen.label}" — succeeded; the page below may still show the old state for a moment`;
+  // No path in the text: the model never sees one.
+  let prefix = `set the file on file input "${chosen.label}" — succeeded; the page below may still show the old state for a moment`;
   if (rest.length) {
     prefix += ` (first of ${pool.length} — others: ${rest.map((h) => h.label).join(", ")}; pass match to pick one)`;
   }
@@ -710,6 +1142,7 @@ function pickOption(value) {
  * events a dropdown listener actually waits for.
  */
 export async function select(ref, value, options) {
+  if (resolve(ref).point) noPoint(ref);
   const { sessionId, backendNodeId } = resolve(ref);
   const { object } = await send(sessionId, "DOM.resolveNode", { backendNodeId });
   const { result, exceptionDetails } = await send(sessionId, "Runtime.callFunctionOn", {
@@ -732,8 +1165,7 @@ export async function select(ref, value, options) {
     throw new Error(outcome.slice("error: ".length));
   }
   console.log(`endo: select ${ref} -> "${outcome}"`);
-  await settle();
-  return snapshot(options);
+  return after(options, `selected "${outcome}"`);
 }
 
 /** What is attached right now — for eyeballing state from the console. */

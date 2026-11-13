@@ -113,7 +113,7 @@
       }
       /* Standard properties, not a re-skinned scrollbar: the panel is narrow
          enough that a 15px default eats 4% of the reading width. */
-      #chat, #log, .table-scroll, pre { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+      .chat, #log, .table-scroll, pre { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 
       .icon { width: 16px; height: 16px; flex: none; display: block; }
 
@@ -202,8 +202,49 @@
       #where-mode.trust { color: var(--danger); border-color: var(--danger); }
       #where-mode.watch { color: var(--gate); border-color: var(--gate); }
 
+      /* ---- lanes ---------------------------------------------------------- */
+      /*
+        Parallel runs (Phase 21). Hidden with one lane, so a single task looks
+        as it always did. Pills wrap rather than scroll: nothing scrolls
+        sideways at 360px. Each pill carries the same state glyph as the
+        provenance row, so a lane that needs you reads by form, not hue alone.
+      */
+      #lanes { display: none; flex: none; flex-wrap: wrap; gap: 5px; margin: 0 12px 6px; }
+      #lanes.show { display: flex; }
+      .lane-pill {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        max-width: 100%;
+        height: 25px;
+        padding: 0 4px 0 9px;
+        font-size: var(--t-meta);
+        color: var(--text-soft);
+        border: 1px solid transparent;
+        border-radius: 999px;
+        background: transparent;
+      }
+      .lane-pill.on { color: var(--text); background: var(--sink); border-color: var(--line); }
+      .lane-pill .icon { width: 12px; height: 12px; flex: none; color: var(--text-faint); }
+      .lane-pill .icon.run { color: var(--accent); animation: pulse 1.6s var(--ease) infinite; }
+      .lane-pill .icon.done { color: var(--accent); }
+      .lane-pill .icon.fail { color: var(--danger); }
+      .lane-pill .icon.gate { color: var(--gate); }
+      .lane-pill .name { min-width: 0; max-width: 16ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .lane-pill:hover:not(.on) { background: var(--sink); }
+      .lane-pill .pick { height: 23px; min-width: 0; padding: 0; gap: 5px; font-size: var(--t-meta); color: inherit; }
+      .lane-pill .pick:hover:not(:disabled) { background: none; color: var(--text); }
+      .lane-pill .close { width: 19px; height: 19px; padding: 0; border-radius: 50%; flex: none; }
+      .lane-pill .close .icon { width: 10px; height: 10px; }
+      .lane-pill:not(.closable) { padding-right: 9px; }
+      #gate-run { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-transform: none; letter-spacing: 0; font-weight: 600; color: var(--text-soft); }
+      #gate-run:not(:empty)::before { content: "· "; }
+
       /* ---- transcript --------------------------------------------------- */
-      #chat {
+      #views { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+      .lane { flex: 1; min-height: 0; display: none; flex-direction: column; }
+      .lane.shown { display: flex; }
+      .chat {
         flex: 1;
         min-height: 0;
         overflow-y: auto;
@@ -214,7 +255,7 @@
         flex-direction: column;
         align-items: stretch;
       }
-      #chat > * { animation: rise var(--slow) var(--ease) both; }
+      .chat > * { animation: rise var(--slow) var(--ease) both; }
       @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
       @keyframes pulse { 50% { opacity: 0.35; } }
 
@@ -460,7 +501,7 @@
         pushed toward the middle of the column rather than parked above the
         composer, so the first screen is an invitation instead of a form.
       */
-      #empty {
+      .empty {
         margin: auto 0;
         animation: none;
         display: flex;
@@ -470,9 +511,9 @@
       }
       /* Hidden, not removed — New Session brings it back, and its seed buttons
          are wired once at load. */
-      #empty.gone { display: none; }
-      #empty .mark { width: 30px; height: 30px; margin-bottom: 12px; }
-      #empty p {
+      .empty.gone { display: none; }
+      .empty .mark { width: 30px; height: 30px; margin-bottom: 12px; }
+      .empty p {
         margin: 0 0 20px;
         font-size: 13.5px;
         line-height: 1.55;
@@ -510,7 +551,7 @@
       .seed:hover { color: var(--text); border-color: var(--line); background: var(--sink); }
 
       /* ---- live step ------------------------------------------------------ */
-      #step {
+      .step {
         flex: none;
         display: none;
         align-items: center;
@@ -519,8 +560,8 @@
         font-size: var(--t-meta);
         color: var(--text-soft);
       }
-      #step.on { display: flex; }
-      #step::before {
+      .step.on { display: flex; }
+      .step::before {
         content: "";
         width: 5px;
         height: 5px;
@@ -584,6 +625,11 @@
         line-height: 1.5;
         overflow-wrap: anywhere;
       }
+      /* The second key's word on the action: loud only when it says no. */
+      #gate-second { display: none; font-size: var(--t-micro); line-height: 1.5; color: var(--text-faint); overflow-wrap: anywhere; }
+      #gate-second.shown { display: block; }
+      #gate-second.block { color: var(--danger); }
+      #gate-second.warn { color: var(--gate); }
       #gate .pair { display: flex; gap: 7px; }
       #gate .pair button { flex: 1; }
 
@@ -911,7 +957,7 @@
       footer details[open] summary { color: var(--text); }
       /* The disclosure opens as a sheet above the composer, so the summary row
          never jumps and the transcript is never pushed off screen. */
-      #log, #history {
+      #log-sheet, #history, #reflexes, #skills, #engines, #plan {
         position: fixed;
         left: 12px;
         right: 12px;
@@ -928,13 +974,119 @@
         line-height: 1.55;
         animation: rise var(--slow) var(--ease) both;
       }
-      #log {
-        max-height: 44vh;
+      #log-sheet { max-height: 44vh; overflow: auto; }
+      #log { white-space: pre-wrap; color: var(--text-soft); margin: 8px 0 0; }
+
+      /* The Reflexes sheet: the History sheet's frame, in the UI font. */
+      #reflexes, #skills, #engines, #plan {
+        max-height: 60vh;
         overflow: auto;
-        white-space: pre-wrap;
+        font-family: var(--sans);
+        font-size: var(--t-meta);
+        line-height: 1.5;
         color: var(--text-soft);
-        margin: 0;
+        scrollbar-width: thin;
+        scrollbar-color: var(--line) transparent;
       }
+      #engines p, #plan p { margin: 0 0 6px; font-size: var(--t-micro); color: var(--text-soft); }
+      #plan-sites {
+        width: 100%;
+        height: 27px;
+        padding: 0 10px;
+        font: var(--t-meta) / 1 var(--sans);
+        color: var(--text);
+        background: var(--sink);
+        border: 1px solid var(--line-soft);
+        border-radius: 999px;
+      }
+      #engines input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
+      #engines select { max-width: none; flex: 0 1 auto; border-color: var(--line-soft); }
+      #reflexes select { max-width: none; flex: 0 1 auto; border-color: var(--line-soft); }
+      #reflexes input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
+      .rx-switch { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: var(--t-ui); font-weight: 560; cursor: pointer; }
+      .rx-list { margin: 8px 0; }
+      .rx-line { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
+      .rx-name { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+      .rx-name b { color: var(--text); font-weight: 600; font-size: var(--t-ui); }
+      .rx-name span { font-size: var(--t-micro); color: var(--text-faint); }
+      .rx-stats { padding: 0 0 4px 0; font-size: var(--t-micro); color: var(--text-faint); font-variant-numeric: tabular-nums; }
+      .rx-status { padding: 4px 0; font-size: var(--t-micro); color: var(--text-faint); }
+      .rx-jev { padding: 6px 0; border-top: 1px solid var(--line-soft); }
+      .rx-jev p { margin: 0 0 6px; font-size: var(--t-micro); color: var(--text-soft); }
+      .rx-keyrow { display: flex; gap: 6px; margin-top: 6px; }
+      #rx-jev-key {
+        flex: 1;
+        min-width: 0;
+        height: 27px;
+        padding: 0 10px;
+        font: var(--t-meta) / 1 var(--sans);
+        color: var(--text);
+        background: var(--sink);
+        border: 1px solid var(--line-soft);
+        border-radius: 999px;
+      }
+      #reflexes .label { margin: 8px 0 4px; }
+      .rx-item { padding: 5px 0; border-top: 1px solid var(--line-soft); }
+      .rx-what { color: var(--text); font-family: var(--mono); font-size: var(--t-micro); overflow-wrap: anywhere; }
+      .rx-meta { font-size: var(--t-micro); color: var(--text-faint); font-variant-numeric: tabular-nums; }
+      .rx-opts { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 4px; }
+      .rx-btn { height: 23px; padding: 0 9px; font-size: var(--t-meta); border-color: var(--line); }
+      .rx-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line-soft); font-size: var(--t-micro); color: var(--text-faint); font-variant-numeric: tabular-nums; }
+
+      /* Skills sheet rows; the buttons reuse .rx-btn / .rx-opts. */
+      .sk-empty { font-size: var(--t-micro); color: var(--text-faint); }
+      .sk-item { padding: 6px 0; border-top: 1px solid var(--line-soft); }
+      .sk-item:first-child { border-top: 0; padding-top: 0; }
+      .sk-item b { color: var(--text); font-size: var(--t-ui); font-weight: 600; }
+      .sk-meta, .sk-task { font-size: var(--t-micro); color: var(--text-faint); }
+      .sk-task { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+      .sk-var { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: var(--t-micro); color: var(--text-soft); }
+      .sk-var span { flex: none; min-width: 64px; }
+      .sk-var input, .pc-name {
+        flex: 1;
+        min-width: 0;
+        height: 25px;
+        padding: 0 9px;
+        font: var(--t-meta) / 1 var(--sans);
+        color: var(--text);
+        background: var(--sink);
+        border: 1px solid var(--line-soft);
+        border-radius: 999px;
+      }
+      .sk-run { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+
+      /* Proposal cards: the gate's frame, calmer (no alert colour). */
+      #proposals { flex: none; display: flex; flex-direction: column; gap: 8px; }
+      #proposals:not(:empty) { margin: 0 12px 10px; }
+      .pc-card {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: var(--r-md);
+        background: var(--raise);
+        animation: rise var(--slow) var(--ease) both;
+      }
+      .pc-title { font-size: var(--t-ui); color: var(--text); }
+      .pc-lines {
+        margin: 0;
+        padding: 6px 8px;
+        max-height: 11.5em;
+        overflow: auto;
+        font: var(--t-micro) / 1.5 var(--mono);
+        color: var(--text-soft);
+        background: var(--sink);
+        border-radius: var(--r-md);
+        scrollbar-width: thin;
+      }
+      .pc-lines div { white-space: pre-wrap; overflow-wrap: anywhere; }
+      .pc-lines .pc-del { color: var(--danger); }
+      .pc-lines .pc-add { color: var(--accent); }
+      .pc-hint { font-size: var(--t-micro); color: var(--text-faint); }
+      .pc-name { flex: none; height: 27px; }
+      .pc-pair { display: flex; gap: 7px; }
+      .pc-pair button { flex: 1; }
 
       /* The session list. Sessions are stored newest first and index 0 is the
          live one, so the list needs no sorting and no "current" section. */
@@ -1067,14 +1219,23 @@
       </button>
     </header>
 
+    <!-- One pill per lane while two or more are open: which runs exist, which
+         one is on screen, and which needs you. Filled by panel.js. -->
+    <div id="lanes" role="tablist" aria-label="Runs"></div>
+
     <div id="where">
       <svg id="where-state" class="icon" aria-hidden="true"><use href="#i-dot" /></svg>
       <span id="where-title" class="idle">no tab attached yet</span>
       <span id="where-mode">Normal</span>
     </div>
 
-    <div id="chat" role="log" aria-live="polite">
-      <div id="empty">
+    <!-- Each lane is a copy of the template below (panel.js), with its own
+         transcript and its own live step line; one is shown at a time. -->
+    <div id="views"></div>
+    <template id="lane-view">
+      <div class="lane">
+      <div class="chat" role="log" aria-live="polite">
+      <div class="empty">
         <svg class="mark" aria-hidden="true"><use href="#i-mark" /></svg>
         <p>I can read and act on the page you are looking at: click, type, fill forms, move between tabs. Type <b>@</b> to point me at another open tab. Drop a file anywhere here — or use the paperclip — and I can read it, or put it into a form.</p>
         <div class="label">Try</div>
@@ -1082,29 +1243,34 @@
         <button class="seed">Find the pricing page and compare the tiers in a table</button>
         <button class="seed">Fill this form from my resume, but stop before submitting</button>
       </div>
-    </div>
-
-    <div id="step" aria-live="polite"></div>
+      </div>
+      <div class="step" aria-live="polite"></div>
+      </div>
+    </template>
 
     <div id="viewing">
       <span>Viewing an earlier session</span>
       <button id="to-current">Back to current</button>
     </div>
 
+    <div id="proposals" aria-live="polite"></div>
+
     <div id="gate">
       <div class="head">
         <svg class="icon" aria-hidden="true"><use href="#i-alert" /></svg>
         Approval needed
+        <span id="gate-run"></span>
       </div>
       <div id="gate-action"></div>
+      <div id="gate-second" role="status"></div>
       <div class="pair">
         <button id="gate-approve" class="primary">
           <svg class="icon" aria-hidden="true"><use href="#i-check" /></svg>
-          Approve
+          <span id="gate-approve-text">Approve</span>
         </button>
         <button id="gate-deny">
           <svg class="icon" aria-hidden="true"><use href="#i-x" /></svg>
-          Deny
+          <span id="gate-deny-text">Deny</span>
         </button>
       </div>
     </div>
@@ -1143,13 +1309,22 @@
                name and for pre-135 Chrome, which ignores the legend. -->
           <optgroup label="Claude">
             <legend>Claude</legend>
-            <option value="sonnet">Sonnet</option>
-            <option value="opus">Opus</option>
+            <option value="claude-sonnet-5-5">Sonnet 5.5</option>
+            <option value="claude-haiku-5-5">Haiku 5.5</option>
+            <option value="claude-opus-5-5">Opus 5.5</option>
           </optgroup>
           <optgroup label="Cursor">
             <legend>Cursor</legend>
-            <option value="cursor-grok-4.5-medium">Grok 4.5</option>
+            <option value="grok-4.7-medium">Grok 4.7</option>
+            <option value="grok-4.7-high">Grok 4.7 High</option>
+            <option value="grok-4.7-low-fast">Grok 4.7 Fast</option>
+            <option value="gemini-3.8-flash-high">Gemini 3.8 Flash</option>
+            <option value="gpt-5.6-sol-high">GPT-5.6 Sol</option>
             <option value="composer-2.5">Composer 2.5</option>
+          </optgroup>
+          <optgroup label="Codex">
+            <legend>Codex</legend>
+            <option value="gpt-6.1-sol">GPT-6.1 Sol</option>
           </optgroup>
         </select>
         <select id="mode" title="how much it may do without asking" aria-label="Autonomy">
@@ -1176,7 +1351,29 @@
       </details>
       <details>
         <summary><svg class="icon" aria-hidden="true"><use href="#i-terminal" /></svg>Log</summary>
-        <pre id="log"></pre>
+        <div id="log-sheet">
+          <button id="audit-export">Export audit (Markdown)</button>
+          <pre id="log"></pre>
+        </div>
+      </details>
+      <details id="reflexes-open">
+        <summary><svg class="icon" aria-hidden="true"><use href="#i-live" /></svg>Reflexes</summary>
+        <div id="reflexes"></div>
+      </details>
+      <details id="plan-open">
+        <summary><svg class="icon" aria-hidden="true"><use href="#i-alert" /></svg>Plan</summary>
+        <div id="plan">
+          <p class="rx-note">Sites this run may act on, comma separated (example.com also covers its subdomains). Leave empty for any site. Anything outside asks you first, in every mode.</p>
+          <input id="plan-sites" type="text" aria-label="Allowed sites" placeholder="example.com, shop.test" autocomplete="off" spellcheck="false" />
+        </div>
+      </details>
+      <details id="engines-open">
+        <summary><svg class="icon" aria-hidden="true"><use href="#i-reply" /></svg>Engines</summary>
+        <div id="engines"></div>
+      </details>
+      <details id="skills-open">
+        <summary><svg class="icon" aria-hidden="true"><use href="#i-check" /></svg>Skills</summary>
+        <div id="skills"></div>
       </details>
     </footer>
 

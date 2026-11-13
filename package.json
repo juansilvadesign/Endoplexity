@@ -1,6 +1,6 @@
 {
   "name": "endoplexity",
-  "version": "0.0.1",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Agentic browser control driven by your own Claude / Cursor subscriptions",
@@ -8,8 +8,13 @@
     "start": "node bridge/src/index.ts",
     "setup": "node scripts/setup.mjs",
     "cursor-login": "node bridge/src/cursor-login.ts",
+    "codex-login": "node bridge/src/codex-login.ts",
     "bench": "node scripts/bench.ts",
-    "test": "node --test \"bridge/test/**/*.test.ts\""
+    "task": "node scripts/run-task.ts",
+    "test": "node --test \"bridge/test/**/*.test.ts\"",
+    "laya-setup": "node scripts/laya-setup.mjs",
+    "test:laya": "node --test bridge/test/laya.live.ts",
+    "reflex:train": "node scripts/reflex-train.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

@@ -1,9 +1,12 @@
 import * as cdp from "./cdp.js";
 import { measure, selftest } from "./selftest.js";
 import { runTool } from "./tools.js";
-import * as ui from "./transcript.js";
-import { fresh, pack, startNew, titleOf } from "./sessions.js";
+import * as baseUi from "./transcript.js";
+import { fresh, MAX_SESSIONS, pack, titleOf } from "./sessions.js";
 import { block as mentionBlock, label as mentionLabel } from "./mentions.js";
+import { initEngines, splitPlan } from "./engines.js";
+import { initReflexes } from "./reflexes.js";
+import { initProposals, initSkills } from "./skills.js";
 import { block as filesBlock, humanSize, toBase64 } from "./attachments.js";
 
 // No token anywhere in here on purpose. The bridge identifies this panel by the
@@ -15,7 +18,7 @@ const BRIDGE = "ws://127.0.0.1:8787";
 // way to reach the CDP layer directly (`endo.snapshot()`, `await
 // endo.selftest()`) — right-click the panel -> Inspect. `endo.task` drives the
 // same path the Run button does, so the buttons never disagree with what is
-// actually running.
+// actually running. All of these act on the lane on screen.
 globalThis.endo = {
   ...cdp,
   selftest,
@@ -28,6 +31,7 @@ globalThis.endo = {
     promptEl.value = answer;
     runTask(true);
   },
+  runSkill: (id, vars) => runSkill(id, vars),
   stop: () => stopBtn.click(),
   // A bug report is now one call and a copy, instead of selecting a <pre>.
   log: () => logEl.textContent,
@@ -39,8 +43,9 @@ const whereState = document.getElementById("where-state");
 const whereTitle = document.getElementById("where-title");
 const whereMode = document.getElementById("where-mode");
 const logEl = document.getElementById("log");
-const chatEl = document.getElementById("chat");
-const stepEl = document.getElementById("step");
+const viewsEl = document.getElementById("views");
+const laneView = document.getElementById("lane-view");
+const lanesEl = document.getElementById("lanes");
 const promptEl = document.getElementById("prompt");
 const runBtn = document.getElementById("run");
 const replyBtn = document.getElementById("reply");
@@ -49,6 +54,7 @@ const modelEl = document.getElementById("model");
 const modeEl = document.getElementById("mode");
 const gate = document.getElementById("gate");
 const gateAction = document.getElementById("gate-action");
+const gateRun = document.getElementById("gate-run");
 const gateApprove = document.getElementById("gate-approve");
 const gateDeny = document.getElementById("gate-deny");
 const newBtn = document.getElementById("new");
@@ -62,49 +68,119 @@ const filesEl = document.getElementById("files");
 const attachBtn = document.getElementById("attach");
 const fileInput = document.getElementById("file-input");
 
-ui.mount(chatEl, stepEl, logEl, () => save());
-
 let socket = null;
-// The bridge holds one task at a time, so at most one gate is ever open.
-// Tracking its id (not just a boolean) lets a stale button click be told apart
-// from a still-live one if a row somehow outlives its gate.
-let pendingGateId = null;
-// Whether the last run left a transcript the bridge can continue. The id itself
-// stays bridge-side. Set from the bridge's `hello` on every connect, because a
-// panel remount used to reset this to false and Reply went dark after a window
-// switch even though the bridge still held the session.
-let resumable = false;
 
 /**
- * Sessions, newest first, with sessions[0] the live one. Mirrored into
- * chrome.storage.local so a transcript outlives both the panel document (Chrome
- * tears it down on every window switch) and the bridge.
- *
- * `viewing` is an index into it. Anything other than 0 is history: read-only,
- * Reply off, and never written back — sessions[0] is the only slot that grows.
+ * Sessions, newest first. Mirrored into chrome.storage.local so a transcript
+ * outlives both the panel document (Chrome tears it down on every window
+ * switch) and the bridge. A session with `open` set is a lane: a run you can
+ * still drive. The rest are History, read-only.
  */
-let sessions = [fresh()];
-let viewing = 0;
-let saveTimer = null;
+let sessions = [];
 
-/** Copy the live journal into the live slot. Cheap; the pack() caps it. */
-function syncLive() {
-  sessions[0].entries = pack(ui.snapshot());
+/*
+ * Lanes (Phase 21): runs side by side, each a session plus everything that
+ * session needs to drive its own tab.
+ *
+ * Every lane loads its own copy of cdp.js and of transcript.js (the `?lane=`
+ * query makes a separate module instance), so each has its own tab, refs and
+ * frames, and its own journal, gate row and step line, with no change to
+ * either module's single-run code. The lane id is also the run id the bridge
+ * keys its state by (bridge/src/run.ts), so every tool call, gate and event
+ * names the lane it belongs to.
+ *
+ *   { id, session, el, ui, cdp, busy, resumable, said, where, scheduled }
+ *
+ * `session.tab` is the tab the lane drives, kept in storage: after a remount
+ * the lane goes back to it instead of taking whatever tab is in front.
+ */
+const lanes = [];
+/** The lane on screen. Run, Reply, Stop, and the console act on it. */
+let shown = null;
+/** The archived session on screen instead of a lane, or null. */
+let viewing = null;
+/** The read-only view History opens into, made on first use. */
+let viewer = null;
+/** The panel-level transcript: the shown lane's, before any lane exists a no-op. */
+let ui = baseUi;
+/** The reflexes' Settle and See states, given to each lane's cdp.js as it opens. */
+let reflexStates = { settle: "off", see: "off" };
+
+const newId = () => `l${crypto.randomUUID().slice(0, 8)}`;
+
+/** A view: a copy of the lane template with a transcript of its own mounted on it. */
+async function makeView(key, changed) {
+  const el = laneView.content.firstElementChild.cloneNode(true);
+  viewsEl.appendChild(el);
+  const view = await import(`./transcript.js?lane=${key}`);
+  view.mount(el.querySelector(".chat"), el.querySelector(".step"), logEl, changed);
+  return { el, ui: view };
+}
+
+const making = new Map();
+/** Open a lane for a stored or new session. Restores its transcript. */
+function openLane(session) {
+  if (!making.has(session.id)) making.set(session.id, makeLane(session));
+  return making.get(session.id);
+}
+
+async function makeLane(session) {
+  const lane = { id: session.id, session, busy: false, resumable: false, said: [], where: { page: undefined, state: "idle" }, scheduled: session.scheduled === true };
+  Object.assign(lane, await makeView(session.id, () => saveLane(lane)));
+  lane.cdp = await import(`./cdp.js?lane=${session.id}`);
+  // Another lane's tab while that lane is running. An idle lane yields its
+  // tab: a finished run holds nothing worth more than the task you start now.
+  // session.tab only follows after a whole tool call, so the live attachment counts too.
+  lane.cdp.setTaken((tab) => lanes.some((other) => other !== lane && other.busy && (other.session.tab === tab || other.cdp?.state().tabId === tab)));
+  lane.cdp.setBackground(lane.scheduled);
+  lane.cdp.setSettle(reflexStates.settle);
+  lane.cdp.setSee(reflexStates.see);
+  // Settle's shadow measurements go back as log rows. A measurement made while
+  // disconnected is dropped silently: it is a statistic, not worth a line.
+  lane.cdp.onSettle((row) => {
+    if (socket?.readyState === WebSocket.OPEN) send({ type: "reflex-log", run: lane.id, row: { reflex: "settle", ...row } });
+  });
+  if (session.entries.length) lane.ui.restore(session.entries.slice());
+  lanes.push(lane);
+  drawLanes();
+  return lane;
+}
+
+/**
+ * The lane a bridge message is for. "" is a bridge or bench from before lanes,
+ * and means the lane on screen. An id with no lane here is a run whose lane
+ * this document never had (storage cleared): it gets one, so its events and
+ * calls have somewhere to land.
+ */
+function laneFor(run) {
+  if (!run) return Promise.resolve(shown);
+  const known = lanes.find((lane) => lane.id === run);
+  if (known) return Promise.resolve(known);
+  const session = { ...fresh(), id: run, open: true };
+  sessions = [session, ...sessions];
+  store();
+  return openLane(session);
+}
+
+/** Remember which tab the lane drives, so a remount returns to it. */
+function noteTab(lane) {
+  const tab = lane.cdp.state().tabId;
+  if (tab === null || tab === lane.session.tab) return;
+  lane.session.tab = tab;
+  store();
 }
 
 /**
  * Debounced, because a running task journals a line every few hundred ms and
  * chrome.storage.local is a real write each time.
  */
-function save() {
-  // A history view replays into the journal, so saving from one would copy an
-  // old transcript over the live slot.
-  if (viewing !== 0) return;
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    syncLive();
+function saveLane(lane) {
+  clearTimeout(lane.saveTimer);
+  lane.saveTimer = setTimeout(() => {
+    lane.session.entries = pack(lane.ui.snapshot());
     store();
     drawHistory();
+    drawLanes();
   }, 400);
 }
 
@@ -114,7 +190,7 @@ function save() {
 // once — a failing write repeats every 400ms and a note per write is its own bug.
 let storageWarned = false;
 function store() {
-  chrome.storage.local.set({ sessions }).catch((err) => {
+  chrome.storage.local.set({ sessions, shownLane: shown?.id }).catch((err) => {
     console.warn("endo: history not saved —", err);
     if (storageWarned) return;
     storageWarned = true;
@@ -138,70 +214,94 @@ function drawHistory() {
     hint.textContent = "nothing yet — finished sessions are kept here";
     return void historyEl.appendChild(hint);
   }
-  sessions.forEach((session, index) => {
+  for (const session of sessions) {
+    const lane = lanes.find((l) => l.session === session);
     const row = document.createElement("button");
-    row.className = index === viewing ? "hrow on" : "hrow";
+    row.className = (viewing ? viewing === session : lane === shown) ? "hrow on" : "hrow";
     const title = document.createElement("span");
     title.className = "htitle";
     title.textContent = titleOf(session);
     const stamp = document.createElement("span");
     stamp.className = "hwhen";
-    stamp.textContent = index === 0 ? "current" : when(session.at);
+    stamp.textContent = lane ? (lane.busy ? "running" : "open") : when(session.at);
     row.append(title, stamp);
-    row.addEventListener("click", () => showSession(index));
+    row.addEventListener("click", () => (lane ? showLane(lane) : showArchived(session)));
     historyEl.appendChild(row);
-  });
+  }
+}
+
+/** Put a lane on screen. Its transcript is already rendered; this only swaps views. */
+function showLane(lane) {
+  viewer?.el.classList.remove("shown");
+  viewing = null;
+  viewingBar.classList.remove("show");
+  shown?.el.classList.remove("shown");
+  shown = lane;
+  ui = lane.ui;
+  lane.el.classList.add("shown");
+  renderWhere();
+  syncButtons();
+  drawGate(true);
+  drawLanes();
+  drawHistory();
+  historyOpen.open = false;
+  chrome.storage.local.set({ shownLane: lane.id }).catch(() => {});
 }
 
 /**
- * Put a session on screen. Restoring a COPY of the entries matters: the journal
- * is appended to by anything that renders, and a history view that shared the
- * stored array would quietly grow an old session every time it printed a note.
+ * An archived session, read-only. Restoring a COPY of the entries matters: the
+ * journal is appended to by anything that renders, and a history view that
+ * shared the stored array would quietly grow an old session.
  */
-function showSession(index) {
-  if (index !== 0 && runBtn.disabled) {
-    return ui.note("a task is running — stop it or wait before opening an earlier session");
-  }
-  if (viewing === 0) syncLive(); // don't lose what has not been debounced yet
-  viewing = index;
-  ui.restore((sessions[index]?.entries ?? []).slice());
-  viewingBar.classList.toggle("show", index !== 0);
-  setBusy(false);
+async function showArchived(session) {
+  viewer ??= await makeView("history");
+  viewer.ui.restore(session.entries.slice());
+  shown.el.classList.remove("shown");
+  viewer.el.classList.add("shown");
+  viewing = session;
+  viewingBar.classList.add("show");
+  syncButtons();
   drawHistory();
   historyOpen.open = false;
 }
 
 /**
- * Tell the bridge to forget its CLI session, or a Reply after the next remount
- * would resume the conversation New just archived.
- *
- * Latched rather than fire-and-forget: with the socket down there is nothing to
- * tell, but the bridge still holds the id, and its `hello` on reconnect would
- * light Reply straight back up on the fresh session. Deliberately not routed
- * through send(), whose "not connected" note would land in the empty transcript
- * this is part of creating.
+ * Close a lane: its session goes to History and the bridge forgets its run.
+ * Only an idle lane closes; a running one is stopped first.
  */
-let dropPending = false;
-
-function dropBridgeSession() {
-  dropPending = true;
-  if (socket?.readyState !== WebSocket.OPEN) return;
-  socket.send(JSON.stringify({ type: "new-session" }));
-  dropPending = false;
+function closeLane(lane) {
+  if (lane.busy) return;
+  lane.session.entries = pack(lane.ui.snapshot());
+  lane.session.open = false;
+  delete lane.session.tab;
+  // With the socket down there is nothing to tell. The bridge keeps that
+  // run's few strings until it restarts, and no lane will ever ask for it again.
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "close-run", run: lane.id }));
+  lane.cdp.detach().catch(() => {});
+  lane.el.remove();
+  lanes.splice(lanes.indexOf(lane), 1);
+  making.delete(lane.id);
+  if (shown === lane) showLane(lanes[0]);
+  store();
+  drawLanes();
+  drawHistory();
 }
 
-/** Start clean without losing what came before — the live one moves to History. */
-function newSession() {
-  syncLive();
-  sessions = startNew(sessions);
-  viewing = 0;
-  viewingBar.classList.remove("show");
-  ui.clear();
-  dropBridgeSession();
-  resumable = false;
-  setBusy(false);
+/**
+ * New. An idle lane goes to History and a fresh one takes its place, as New
+ * always did. A running one stays open beside the new lane: that is how a
+ * second task runs at the same time as the first.
+ */
+async function newSession() {
+  const was = shown;
+  if (!was.busy && !was.session.entries.length && !viewing) return void promptEl.focus();
+  const session = { ...fresh(), id: newId(), open: true };
+  // Open lanes are never the ones the cap drops.
+  sessions = [session, ...sessions].filter((s, i) => i < MAX_SESSIONS || s.open);
+  const lane = await openLane(session);
+  showLane(lane);
+  if (!was.busy) closeLane(was);
   store();
-  drawHistory();
   promptEl.focus();
 }
 
@@ -218,29 +318,77 @@ function setState(state, text) {
  * was active when it first attached. A Greenhouse form was filled perfectly,
  * every tool returning success, in a tab nobody was watching. Re-attaching on a
  * fresh Run fixed the cause; showing the tab is what makes it visible when it
- * happens again for some other reason.
+ * happens again for some other reason. Per lane: the row shows the lane on screen.
  */
-const STATE_ICON = { idle: "#i-dot", run: "#i-live", done: "#i-check", fail: "#i-x" };
+const STATE_ICON = { idle: "#i-dot", run: "#i-live", done: "#i-check", fail: "#i-x", gate: "#i-alert" };
 
-function setWhere(page, state) {
-  if (page !== undefined) {
-    whereTitle.textContent = page ? page.title || page.url : "no tab attached yet";
-    whereTitle.title = page ? page.url : "";
-    whereTitle.classList.toggle("idle", !page);
-  }
-  if (state !== undefined) {
-    whereState.firstElementChild.setAttribute("href", STATE_ICON[state] ?? STATE_ICON.idle);
-    // setAttribute, not .className: on an SVGElement className is a read-only
-    // SVGAnimatedString, so assigning to it silently does nothing.
-    whereState.setAttribute("class", state === "idle" ? "icon" : `icon ${state}`);
-  }
+function setWhere(lane, page, state) {
+  if (page !== undefined) lane.where.page = page;
+  if (state !== undefined) lane.where.state = state;
+  if (lane === shown) renderWhere();
+  drawLanes();
+}
+
+function renderWhere() {
+  const { page, state } = shown.where;
+  whereTitle.textContent = page ? page.title || page.url : "no tab attached yet";
+  whereTitle.title = page ? page.url : "";
+  whereTitle.classList.toggle("idle", !page);
+  whereState.firstElementChild.setAttribute("href", STATE_ICON[state] ?? STATE_ICON.idle);
+  // setAttribute, not .className: on an SVGElement className is a read-only
+  // SVGAnimatedString, so assigning to it silently does nothing.
+  whereState.setAttribute("class", state === "idle" ? "icon" : `icon ${state}`);
+}
+
+/** The pills: one per lane, shown only once there are two. */
+function drawLanes() {
+  lanesEl.classList.toggle("show", lanes.length > 1);
+  if (lanes.length < 2) return void lanesEl.replaceChildren();
+  lanesEl.replaceChildren(
+    ...lanes.map((lane) => {
+      const pill = document.createElement("div");
+      const closable = !lane.busy;
+      pill.className = `lane-pill${lane === shown && !viewing ? " on" : ""}${closable ? " closable" : ""}`;
+      const pick = document.createElement("button");
+      pick.className = "pick";
+      pick.setAttribute("role", "tab");
+      pick.setAttribute("aria-selected", String(lane === shown));
+      const state = gates.some((g) => g.lane === lane) ? "gate" : lane.busy ? "run" : lane.where.state;
+      const title = titleOf(lane.session);
+      pick.title = `${title} (${{ gate: "needs you", run: "running", done: "done", fail: "failed" }[state] ?? "idle"})`;
+      pick.append(spriteIcon(STATE_ICON[state] ?? STATE_ICON.idle, state), Object.assign(document.createElement("span"), { className: "name", textContent: title }));
+      pick.addEventListener("click", () => showLane(lane));
+      pill.appendChild(pick);
+      if (closable) {
+        const close = document.createElement("button");
+        close.className = "close";
+        close.title = close.ariaLabel = `Close "${title}": it stays in History`;
+        close.appendChild(spriteIcon("#i-x"));
+        close.addEventListener("click", () => closeLane(lane));
+        pill.appendChild(close);
+      }
+      return pill;
+    }),
+  );
 }
 
 function showMode() {
-  whereMode.textContent = modeEl.selectedOptions[0].textContent;
+  const sites = splitPlan(planRaw).length;
+  whereMode.textContent = modeEl.selectedOptions[0].textContent + (sites ? ` · ${sites} site${sites === 1 ? "" : "s"}` : "");
   // Trust turns off the only safety feature there is, so it must never be
   // quietly in force — it stays on screen, coloured, the whole time it is set.
   whereMode.className = modeEl.value === "normal" ? "" : modeEl.value;
+}
+
+/** Save text as a file without the downloads permission: a temporary link, clicked. */
+function saveFile(name, text) {
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([text], { type: "text/markdown" }));
+  link.download = name;
+  link.click();
+  // Not in the same tick: revoking before the download has read the blob can
+  // cancel it.
+  setTimeout(() => URL.revokeObjectURL(link.href), 10_000);
 }
 
 /** Returns false if there was nowhere to send it, so callers can bail. */
@@ -253,26 +401,128 @@ function send(payload) {
   return true;
 }
 
-function showGate({ id, action }) {
-  pendingGateId = id;
-  gateAction.textContent = action;
-  gate.classList.add("show");
-  ui.gateRow(action);
+// The raw log follows its tail only while open (transcript.js raw), so it
+// starts at the newest line when you open it.
+logEl.closest("details")?.addEventListener("toggle", (e) => {
+  if (e.target.open) logEl.scrollTop = logEl.scrollHeight;
+});
+
+// Reflexes: the sheet only draws the bridge's last message.
+const reflexes = initReflexes(document.getElementById("reflexes"), send);
+document.getElementById("reflexes-open").addEventListener("toggle", (e) => {
+  if (e.target.open && socket?.readyState === WebSocket.OPEN) send({ type: "reflex-status" });
+});
+
+// The failover order, set from the Engines sheet once storage has been read.
+let fallbacks = [];
+// The Plan box (allowed sites) and the Second key switch: both ride on every
+// task and run-skill, and both are read back from storage below.
+let planRaw = "";
+let secondKey = true;
+const planEl = document.getElementById("plan-sites");
+
+// Skills and proposals are bridge state too: redrawn from the last message on
+// every connect, never journalled into the chat.
+const skillsSheet = initSkills(document.getElementById("skills"), send, runSkill, () => {
+  document.getElementById("skills-open").open = false;
+});
+const proposals = initProposals(document.getElementById("proposals"), send);
+
+// The Obstacle reflex reuses the gate for "solve this, then continue", so the
+// buttons can carry its words; the icons stay.
+function gateLabels(ok = "Approve", no = "Deny") {
+  document.getElementById("gate-approve-text").textContent = ok;
+  document.getElementById("gate-deny-text").textContent = no;
 }
 
-function hideGate() {
-  pendingGateId = null;
-  gate.classList.remove("show");
+const gateSecond = document.getElementById("gate-second");
+const VERDICT = { allow: "Allow", warn: "Warn", block: "Block" };
+
+/**
+ * Approvals waiting on you, oldest first, across every lane. Each run asks at
+ * most one at a time (the bridge's per-run lock), so two only queue when two
+ * runs ask at once. The card shows the shown lane's first, else the oldest,
+ * and names its run once there is more than one lane.
+ */
+let gates = [];
+/** The gate the card is showing, or null. */
+let onCard = null;
+
+const secondText = (second) => {
+  const word = VERDICT[second.verdict];
+  return word ? `Second key (${second.by}): ${word}. ${second.reason}` : `Second key unavailable (${second.by}): ${second.reason}`;
+};
+const gateText = ({ action, second }) => (second ? `${action} · ${secondText(second)}` : action);
+
+async function showGate(msg) {
+  const lane = await laneFor(msg.run);
+  const g = { ...msg, lane };
+  gates.push(g);
+  lane.ui.gateRow(gateText(msg));
+  // The bridge denies an unanswered approval after 60 s (relay.ts
+  // GATE_TIMEOUT_MS); a card that outlives that answers nothing, and sits in
+  // front of a live one.
+  setTimeout(() => {
+    if (!gates.includes(g)) return;
+    gates = gates.filter((other) => other !== g);
+    g.lane.ui.gateSettled(false);
+    g.lane.ui.note("denied: timed out");
+    drawGate();
+    drawLanes();
+  }, 60_000);
+  drawGate();
+  drawLanes();
+}
+
+// Clicks ignored until this time: a card that has just changed must not take a
+// click, or a double-click (or one aimed at the card that was there a moment
+// ago) approves an action nobody read.
+let armedAt = 0;
+const GATE_ARM_MS = 500;
+
+/** `repick` is for switching lanes only: otherwise the card on screen stays put. */
+function drawGate(repick = false) {
+  const was = onCard;
+  const mine = gates.find((g) => g.lane === shown);
+  onCard = repick && mine ? mine : gates.includes(onCard) ? onCard : (mine ?? gates[0] ?? null);
+  if (onCard !== was) armedAt = Date.now() + GATE_ARM_MS;
+  // The button that was clicked keeps focus, so Enter or Space would answer the next card.
+  if (gate.contains(document.activeElement)) document.activeElement.blur();
+  gateLabels();
+  gateSecond.textContent = "";
+  gateSecond.className = "";
+  gateApprove.classList.add("primary");
+  gateDeny.classList.remove("primary");
+  if (!onCard) return void gate.classList.remove("show");
+  const { action, ok, no, second, lane } = onCard;
+  gateAction.textContent = action;
+  gateRun.textContent = lanes.length > 1 ? titleOf(lane.session) : "";
+  gateLabels(ok || undefined, no || undefined);
+  if (second) {
+    const word = VERDICT[second.verdict];
+    gateSecond.textContent = secondText(second);
+    gateSecond.className = `shown ${word ? second.verdict : ""}`;
+    if (second.verdict === "block") {
+      // A reflexive click on the usual spot must deny, so the primary look moves.
+      gateLabels("Override", no || undefined);
+      gateApprove.classList.remove("primary");
+      gateDeny.classList.add("primary");
+    }
+  }
+  gate.classList.add("show");
 }
 
 /** Approve/Deny share this — only the boolean differs. */
 function replyGate(approved) {
-  // A click can still land after the row is hidden (double-click, or the task
-  // ended first) — with no pending id there is nothing left to resolve.
-  if (pendingGateId === null) return;
-  send({ type: "gate-reply", id: pendingGateId, approved });
-  hideGate();
-  ui.gateSettled(approved);
+  // A click can still land after the card is gone (double-click, or the task
+  // ended first): with nothing on the card there is nothing left to resolve.
+  const g = onCard;
+  if (!g || Date.now() < armedAt) return;
+  send({ type: "gate-reply", id: g.id, approved });
+  gates = gates.filter((other) => other !== g);
+  g.lane.ui.gateSettled(approved);
+  drawGate();
+  drawLanes();
 }
 
 gateApprove.addEventListener("click", () => replyGate(true));
@@ -281,21 +531,32 @@ gateDeny.addEventListener("click", () => replyGate(false));
 // Tools that land somewhere new, so the header has to be re-read afterwards.
 const MOVES = new Set(["navigate", "use_tab", "back", "forward"]);
 
-/** Run a tool the bridge asked for and answer it, however it went. */
-async function answer({ id, name, args, label }) {
+// A skill replay can type a secret. What it typed must not reach the journal
+// (chrome.storage.local), the transcript or the raw log: they keep args verbatim.
+const SECRET_FIELD = /password|passcode|\bpin\b|cvc|cvv|security code|card number|one-time|otp/i;
+const masked = (msg) => (msg.name === "type" && SECRET_FIELD.test(msg.label ?? "") ? { ...msg, args: { ...msg.args, text: "(hidden)" } } : msg);
+
+/** Run a tool the bridge asked for, in the lane it belongs to, and answer it. */
+async function answer({ id, name, args, label, run }) {
+  const lane = await laneFor(run);
+  const shownArgs = masked({ name, args, label }).args;
   // The row goes up before the call runs: this is the "watch it work" line, and
   // a step that only appears once it has finished is not one.
-  const row = ui.tool(name, args, label);
+  // The gate's checks before an action are the bridge's business, not a step
+  // the agent took, so they get no row.
+  const row = name === "label" || name === "screenshot" || name === "point" || args?.peek ? null : lane.ui.tool(name, shownArgs, label);
   try {
-    const value = await runTool(name, args);
-    row.ok(value);
-    if (MOVES.has(name)) setWhere(await cdp.currentPage().catch(() => null));
+    const value = await runTool(name, args, lane.cdp, lane.session.tab ?? null, lane.scheduled);
+    noteTab(lane);
+    row?.ok(value);
+    if (MOVES.has(name)) setWhere(lane, await lane.cdp.currentPage().catch(() => null));
     send({ type: "tool-result", id, ok: true, value });
   } catch (err) {
+    noteTab(lane);
     // Errors go back as results, not thrown away: "stale ref" is the model's cue
     // to snapshot again, and it can only act on what it is told.
-    row.fail(err.message);
-    send({ type: "tool-result", id, ok: false, error: err.message });
+    row?.fail(err.message);
+    send({ type: "tool-result", id, ok: false, error: err.message, page: err.page });
   }
 }
 
@@ -314,6 +575,7 @@ function cost(event) {
     (u.output_tokens ?? u.outputTokens ?? 0);
   const parts = [];
   if (event.total_cost_usd !== undefined) parts.push(`$${event.total_cost_usd.toFixed(4)}`);
+  if (event.see_usd > 0) parts.push(`See $${event.see_usd.toFixed(4)}`);
   if (tokens) parts.push(`${tokens.toLocaleString()} tokens`);
   if (event.num_turns !== undefined) parts.push(`${event.num_turns} turns`);
   parts.push(`${Math.round((event.duration_ms ?? 0) / 1000)}s`);
@@ -321,8 +583,8 @@ function cost(event) {
 }
 
 /**
- * Everything the model has said this run, so the result event can be recognised
- * as a repeat of it.
+ * `lane.said`: everything the model has said this run, so the result event can
+ * be recognised as a repeat of it.
  *
  * Both CLIs emit the final message twice — once as an assistant event, once as
  * the result's summary. This used to hold only the LATEST assistant text, which
@@ -332,12 +594,10 @@ function cost(event) {
  * a second time under the first. Measured on grok, 2026-08-12, on a
  * three-tab research run.
  */
-let said = [];
-/** A repeat of anything said this run, including a run of messages joined. */
-const alreadySaid = (text) => said.join("\n").includes(text);
+const alreadySaid = (lane, text) => lane.said.join("\n").includes(text);
 
 /**
- * One task event -> the conversation.
+ * One task event -> the lane's conversation.
  *
  * Tool calls are deliberately NOT read out of the model's events any more. The
  * bridge already tells the panel every call it must run, with its name and
@@ -345,7 +605,8 @@ const alreadySaid = (text) => said.join("\n").includes(text);
  * and cursor's separate `tool_call` events both stop needing special cases, and
  * a gate-denied call correctly shows an approval row and no tool row.
  */
-function show(event) {
+function show(lane, event) {
+  const ui = lane.ui;
   if (event.type === "assistant") {
     const text = (event.message?.content ?? [])
       .filter((part) => part.type !== "tool_use")
@@ -353,7 +614,7 @@ function show(event) {
       .join("\n")
       .trim();
     if (!text) return;
-    said.push(text);
+    lane.said.push(text);
     return ui.assistant(text);
   }
   // cursor's tool_call event is now redundant with answer()'s row.
@@ -369,20 +630,22 @@ function show(event) {
     );
   }
   if (event.type === "retry") return ui.note(`↻ ${event.reason}`);
+  if (event.type === "handoff") return ui.note(`↪ ${event.reason}`);
   if (event.type === "result") {
     const text = String(event.result ?? "").trim();
     // Usually a verbatim repeat of what was already said, but not always: cursor
     // can finish with result:"" after leaving its answer in thinking deltas
     // (measured on composer-2.5), so dropping it unconditionally would lose the
     // only copy on some runs.
-    if (text && !alreadySaid(text)) ui.assistant(text);
-    else if (!text && !said.length) {
+    if (text && !alreadySaid(lane, text)) ui.assistant(text);
+    else if (!text && !lane.said.length) {
       ui.note("the model produced no text — cursor sometimes leaves its answer in thinking deltas");
     }
     return ui.chip(cost(event));
   }
   // Red, not the housekeeping grey every other note uses: a run that ended in
   // failure is the one note that must not read like "reconnected".
+  if (event.type === "done" && event.stopped) return ui.note("stopped");
   if (event.type === "done" && event.error) return ui.note(`failed — ${event.error}`, true);
   if (event.type === "failed") return ui.note(`failed — ${event.error}`, true);
 }
@@ -432,31 +695,36 @@ function connect() {
     }, 20_000);
   };
 
-  ws.onmessage = (event) => {
+  ws.onmessage = async (event) => {
     // Everything, including messages the conversation drops — this is the log
     // that settles "did the agent actually have the tools".
-    ui.raw(`< ${event.data}`);
-    const msg = JSON.parse(event.data);
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch (err) {
+      ui.raw(`< ${event.data}`);
+      throw err;
+    }
+    ui.raw(`< ${msg.type === "tool" ? JSON.stringify(masked(msg)) : event.data}`);
     if (msg.type === "pong") return void (missedPong = false);
     if (msg.type === "tool") return void answer(msg);
     if (msg.type === "hello") {
-      // A New pressed while the socket was down is only now reaching the bridge,
-      // so this hello describes the session it is about to drop — don't believe
-      // its `resumable`.
-      const dropping = dropPending;
-      if (dropping) dropBridgeSession();
-      // What the panel cannot know after a remount.
-      resumable = dropping ? false : msg.resumable === true;
+      // What the panel cannot know after a remount: which runs are still going
+      // and which left a transcript to reply to, per lane.
+      const runs = new Map((msg.runs ?? []).map((r) => [r.run, r]));
+      // A run the bridge has going whose lane this document never had.
+      for (const [run, r] of runs) if (run && r.running) await laneFor(run);
+      for (const lane of lanes) {
+        const r = runs.get(lane.id);
+        lane.resumable = r?.resumable === true;
+        setBusy(lane, r?.running === true);
+        if (r?.running) lane.ui.note("reconnected — the task that was running is still running");
+      }
       // Including which files exist: they live on the bridge's disk, and this
       // document is torn down and rebuilt on every window switch.
       files = msg.files ?? [];
       drawFiles();
-      // Its events are about to start arriving, and they belong to the live
-      // transcript — not to whatever archived one is on screen.
-      if (msg.running && viewing !== 0) showSession(0);
-      setBusy(msg.running === true);
-      if (msg.running) ui.note("reconnected — the task that was running is still running");
-      return;
+      return void drawHistory();
     }
     // The bridge answers every attach and every remove with the whole list, so
     // the chips are never drawn from this side's guess about what a click did.
@@ -465,24 +733,45 @@ function connect() {
       return void drawFiles();
     }
     if (msg.type === "file-failed") return void ui.note(`could not attach — ${msg.error}`, true);
+    if (msg.type === "reflex-failed") return void ui.note(msg.error, true);
     if (msg.type === "gate") return void showGate(msg);
+    if (msg.type === "audit") return void saveFile(msg.name, msg.markdown);
+    if (msg.type === "skills") return void skillsSheet.apply(msg);
+    if (msg.type === "proposals") return void proposals.apply(msg);
+    // What an approved proposal wrote, so Save is not a card that just vanishes.
+    // A note from inside a run lands in that run's lane.
+    if (msg.type === "note") return void (lanes.find((lane) => lane.id === msg.run) ?? shown).ui.note(msg.text);
+    if (msg.type === "reflexes") {
+      reflexStates = {
+        settle: msg.settings.enabled ? msg.settings.settle.state : "off",
+        see: msg.settings.enabled && msg.settings.see?.state === "act" ? "act" : "off",
+      };
+      for (const c of [cdp, ...lanes.map((lane) => lane.cdp)]) (c.setSettle(reflexStates.settle), c.setSee(reflexStates.see));
+      return void reflexes.apply(msg);
+    }
+    // claude's reader subagent started or handed back: see forget() in cdp.js.
+    if (msg.type === "forget") return void (await laneFor(msg.run)).cdp.forget();
+    // scripts/run-task.ts, through the bridge: a lane of its own, on a tab of its own.
+    if (msg.type === "scheduled") return void runScheduled(msg);
     if (msg.type === "task-event") {
+      const lane = await laneFor(msg.run);
       // "done" is the child exiting, however it went — including a Stop.
       if (msg.event.type === "done" || msg.event.type === "failed") {
         // The bridge annotates the terminal event rather than sending one of
         // its own, so Reply lights up in the same tick Run does.
-        resumable = msg.event.resumable === true;
-        setBusy(false);
-        setWhere(undefined, msg.event.error ? "fail" : "done");
+        lane.resumable = msg.event.resumable === true;
+        setBusy(lane, false);
+        setWhere(lane, undefined, msg.event.error ? "fail" : "done");
         // The bridge only denies-and-moves-on after its own 60s timeout, but the
-        // task can also end first (Stop, crash) — either way the row must not
+        // task can also end first (Stop, crash) — either way the card must not
         // sit there looking answerable once nothing is listening.
-        if (pendingGateId !== null) {
-          hideGate();
-          ui.note("gate unanswered — the bridge denied it when the task ended");
+        if (gates.some((g) => g.lane === lane)) {
+          gates = gates.filter((g) => g.lane !== lane);
+          drawGate();
+          lane.ui.note("gate unanswered — the bridge denied it when the task ended");
         }
       }
-      return void show(msg.event);
+      return void show(lane, msg.event);
     }
   };
 
@@ -493,7 +782,10 @@ function connect() {
   ws.onclose = () => {
     if (ws !== socket) return; // superseded by a newer connect()
     stopBeat();
-    setBusy(false);
+    for (const lane of lanes) setBusy(lane, false);
+    // The bridge denies every open approval when the socket goes.
+    gates = [];
+    drawGate();
     setState("down", opened ? "reconnecting…" : "bridge not running");
     if (!opened && backoff === 1000) {
       ui.note("no bridge on 127.0.0.1:8787 — it starts at login, or double-click Endoplexity.vbs. If it IS running, .endo-bridge.log says which origin it refused.");
@@ -502,21 +794,68 @@ function connect() {
   };
 }
 
-// The bridge runs one task at a time, so the buttons say which one is possible.
-function setBusy(on) {
-  runBtn.disabled = on;
-  // Never from a history view: the bridge holds one transcript, and it is the
-  // live one — replying from an archived session would answer a different
-  // conversation than the one on screen.
-  replyBtn.disabled = on || !resumable || viewing !== 0;
-  stopBtn.disabled = !on;
-  // A new session while a task runs would leave the running task journalling
-  // into it. Stop first.
-  newBtn.disabled = on;
-  if (!on) ui.step(null);
+// Each lane runs one task at a time, so the buttons say which one is possible
+// in the lane on screen.
+function setBusy(lane, on) {
+  lane.busy = on;
+  if (!on) lane.ui.step(null);
+  if (lane === shown) syncButtons();
+  drawLanes();
 }
 
-/** Run is a fresh conversation; Reply continues the last one. */
+function syncButtons() {
+  const on = shown.busy;
+  runBtn.disabled = on;
+  // Never from a history view: replying from an archived session would answer
+  // a different conversation than the one on screen.
+  // While busy the Reply button steers the running agent instead.
+  replyBtn.disabled = viewing !== null || (on ? false : !shown.resumable);
+  replyBtn.title = on
+    ? "Send to the running agent: Enter"
+    : "Reply — ctrl+Enter. Answers the agent, keeping the last run's context";
+  replyBtn.setAttribute("aria-label", on ? "Send to the running agent: Enter" : "Reply");
+  stopBtn.disabled = !on;
+  // New beside a running task opens a second lane; it never takes this one over.
+  newBtn.title = on ? "Run another task alongside this one" : "New session — this one is kept in History";
+  newBtn.setAttribute("aria-label", on ? "Run another task alongside this one" : "New session");
+}
+
+// The task names the group any tabs this run opens will land in, so three
+// pricing pages read as one piece of work rather than three strays. A reply
+// deliberately keeps the previous name: it is the same piece of work.
+async function rebind(lane, name) {
+  lane.cdp.nameRun(name);
+  try {
+    await lane.cdp.detach();
+    // A scheduled run never takes the tab you are on: it opens its own.
+    if (lane.scheduled) await lane.cdp.attachOwn();
+    else await lane.cdp.attach(undefined, { open: false });
+  } catch (err) {
+    // Not fatal: runTool attaches lazily on the first call, so the task can
+    // still run — it just loses the page context.
+    lane.ui.note(`could not attach to the active tab — ${err.message}`);
+  }
+  noteTab(lane);
+}
+
+/** A saved skill is a fresh run on the tab you are looking at, like Run. */
+async function runSkill(id, vars = {}) {
+  const lane = shown;
+  if (lane.busy) return ui.note("a task is already running in this lane — press + to run another beside it");
+  if (viewing) showLane(lane);
+  const name = id.split("/").pop();
+  setBusy(lane, true);
+  lane.said = [];
+  await rebind(lane, name);
+  const page = await lane.cdp.currentPage().catch(() => null);
+  if (!send({ type: "run-skill", run: lane.id, id, vars, model: modelEl.value, mode: modeEl.value, fallbacks, plan: splitPlan(planRaw), secondKey })) {
+    return setBusy(lane, false);
+  }
+  lane.ui.user(`Run skill: ${name}`);
+  setWhere(lane, page, "run");
+}
+
+/** Run is a fresh conversation; Reply continues the last one. Both in the lane on screen. */
 async function runTask(resume = false) {
   // The console path shares this, so the guard lives here rather than on the
   // button — otherwise endo.task() twice gets an "already running" failure back
@@ -524,28 +863,58 @@ async function runTask(resume = false) {
   if (resume ? replyBtn.disabled : runBtn.disabled) {
     // Reply is disabled for three different reasons — say which one applies.
     return ui.note(
-      resume && viewing !== 0
+      resume && viewing
         ? "you are reading an earlier session — go back to the current one to reply"
-        : resume && !resumable
+        : resume && !shown.resumable
           ? "nothing to reply to yet"
-          : "a task is already running — stop it first",
+          : "a task is already running in this lane — press + to run another beside it",
     );
   }
 
-  // Run always drives the live session, so it takes you back to it first —
-  // otherwise the new task's events would render into an archived transcript.
-  if (viewing !== 0) showSession(0);
+  // Run always drives a lane, so it takes you back to it first.
+  if (viewing) showLane(shown);
 
   const typed = promptEl.value.trim();
   // The placeholder is an example task, so falling back to it on a reply would
   // send the agent an answer it never asked for.
   if (resume && !typed) return ui.note("type your answer first");
   const prompt = typed || promptEl.placeholder;
+  // Always. It used to be kept on a fresh Run, on the theory that a task is
+  // worth re-running — but the task is already the heading of its own answer
+  // two lines up, so what the box actually held was a stale copy sitting under
+  // a live run, and the next task had to be typed around it.
+  if (await start(shown, prompt, { resume, pointed: mentionBlock(prompt, mentions) })) promptEl.value = "";
+}
 
-  // Claim the slot before the await below, or a second Run lands in the window
+/**
+ * A task from scripts/run-task.ts. Its own lane, so it never lands in the
+ * conversation you are having, and its own tab (rebind), so it never drives the
+ * page you are on. The view stays where it is unless the lane on screen is an
+ * empty one.
+ */
+async function runScheduled({ run, task, model }) {
+  const lane = await laneFor(run);
+  lane.scheduled = true;
+  lane.session.scheduled = true; // kept, so a remount still knows not to take your tab
+  lane.cdp.setBackground(true);
+  store();
+  if (!shown.busy && !shown.session.entries.length && shown !== lane) {
+    const empty = shown;
+    showLane(lane);
+    closeLane(empty);
+  }
+  await start(lane, String(task), { model });
+}
+
+/**
+ * Send a task for `lane`. Returns whether it went. `pointed` is the @-mentions
+ * block, which only a typed task has.
+ */
+async function start(lane, prompt, { resume = false, pointed = "", model = modelEl.value } = {}) {
+  // Claim the lane before the await below, or a second Run lands in the window
   // where the guard has passed but nothing is disabled yet.
-  setBusy(true);
-  said = [];
+  setBusy(lane, true);
+  lane.said = [];
 
   // A fresh Run drives the tab you are looking at NOW.
   //
@@ -560,38 +929,26 @@ async function runTask(resume = false) {
   // costs nothing. A reply must not — mid-conversation the agent is holding
   // refs, and they belong to the tab it has been looking at all along.
   //
-  // `open: false`: re-binding must never CREATE a tab. With nothing drivable
-  // open (a fresh window is one chrome://newtab), Run used to open an active
-  // about:blank and drop you on it — a black page under a "started debugging
-  // this browser" banner — for the whole of the model's first turn. The first
-  // tool call opens the tab it needs, and navigates it immediately.
-  if (!resume) {
-    // The task names the group any tabs this run opens will land in, so three
-    // pricing pages read as one piece of work rather than three strays. A reply
-    // deliberately keeps the previous name: it is the same piece of work.
-    cdp.nameRun(prompt);
-    try {
-      await cdp.detach();
-      await cdp.attach(undefined, { open: false });
-    } catch (err) {
-      // Not fatal: runTool attaches lazily on the first call, so the task can
-      // still run — it just loses the page context below.
-      ui.note(`could not attach to the active tab — ${err.message}`);
-    }
-  }
+  // `open: false` (in rebind): re-binding must never CREATE a tab. With nothing
+  // drivable open (a fresh window is one chrome://newtab), Run used to open an
+  // active about:blank and drop you on it — a black page under a "started
+  // debugging this browser" banner — for the whole of the model's first turn.
+  // The first tool call opens the tab it needs, and navigates it immediately.
+  // When another lane is driving the tab in front, the same holds: this lane
+  // gets a tab of its own on its first call (cdp.js findDrivable).
+  if (!resume) await rebind(lane, prompt);
 
   // "Apply to THIS job" is unanswerable unless the task says which page this is.
   // Without it the agent asked for a URL instead of acting — it has no way to
   // know a tab is even open. Skipped on a reply: it is already in the
-  // transcript, and the agent has been looking at that page ever since.
-  const page = resume ? null : await cdp.currentPage().catch(() => null);
-  // Unlike the page line, this is NOT skipped on a reply: a tab mentioned in a
-  // follow-up is new information, and the transcript cannot already hold it.
-  const pointed = mentionBlock(prompt, mentions);
-  // Also not skipped on a reply, and for a stronger reason than mentions: a
-  // file can be attached DURING a conversation — "here's my cover letter too" —
-  // and the transcript cannot already hold a key that did not exist when the
-  // run started. It costs one line per file.
+  // transcript, and the agent has been looking at that page ever since. A
+  // blank tab a scheduled run opened is no page to name.
+  const at = resume ? null : await lane.cdp.currentPage().catch(() => null);
+  const page = at && /^(https?|file):/.test(at.url) ? at : null;
+  // Not skipped on a reply, for a stronger reason than mentions: a file can be
+  // attached DURING a conversation — "here's my cover letter too" — and the
+  // transcript cannot already hold a key that did not exist when the run
+  // started. It costs one line per file.
   const attached = filesBlock(files);
   // The bridge gets `sent`; the transcript below shows `prompt` alone, so the
   // conversation reads as what the human said rather than as plumbing.
@@ -600,15 +957,21 @@ async function runTask(resume = false) {
     .join("\n\n");
   // The model rides along, but the bridge overrules it on a reply: a claude
   // transcript cannot be handed to cursor-agent.
-  if (!send({ type: "task", prompt: sent, model: modelEl.value, mode: modeEl.value, resume })) {
-    return setBusy(false);
+  if (!send({ type: "task", run: lane.id, task: prompt, prompt: sent, model, mode: modeEl.value, resume, fallbacks, plan: splitPlan(planRaw), secondKey })) {
+    setBusy(lane, false);
+    return false;
   }
-  ui.user(prompt);
-  setWhere(resume ? undefined : page, "run");
-  // Always. It used to be kept on a fresh Run, on the theory that a task is
-  // worth re-running — but the task is already the heading of its own answer
-  // two lines up, so what the box actually held was a stale copy sitting under
-  // a live run, and the next task had to be typed around it.
+  lane.ui.user(prompt);
+  setWhere(lane, resume ? undefined : page, "run");
+  return true;
+}
+
+/** A message for the agent mid-run: the raw typed text, no page line or files. */
+function steer() {
+  const text = promptEl.value.trim();
+  if (!text) return ui.note("type a message for the agent first");
+  if (!send({ type: "steer", run: shown.id, text })) return;
+  ui.user(text);
   promptEl.value = "";
 }
 
@@ -621,24 +984,25 @@ modeEl.addEventListener("change", () => {
 
 // The empty state's examples load the box rather than firing straight off — the
 // point is to show what a task looks like, and an agent that starts driving the
-// browser on a stray click is not a good first impression.
-for (const seed of document.querySelectorAll(".seed")) {
-  seed.addEventListener("click", () => {
-    promptEl.value = seed.textContent.trim();
-    promptEl.focus();
-  });
-}
+// browser on a stray click is not a good first impression. Delegated: every
+// lane's view carries its own copy of them.
+viewsEl.addEventListener("click", (event) => {
+  const seed = event.target.closest?.(".seed");
+  if (!seed) return;
+  promptEl.value = seed.textContent.trim();
+  promptEl.focus();
+});
 
 newBtn.addEventListener("click", () => newSession());
-toCurrentBtn.addEventListener("click", () => showSession(0));
+toCurrentBtn.addEventListener("click", () => showLane(shown));
 
 // Wrapped, not passed directly — a listener is handed the MouseEvent, which as
 // runTask's first argument would make every click a reply.
 runBtn.addEventListener("click", () => runTask());
-replyBtn.addEventListener("click", () => runTask(true));
+replyBtn.addEventListener("click", () => (runBtn.disabled ? steer() : runTask(true)));
 stopBtn.addEventListener("click", () => {
   ui.note("stopping");
-  send({ type: "stop" });
+  send({ type: "stop", run: shown.id });
 });
 
 /* ---- attaching a file ------------------------------------------------------
@@ -666,10 +1030,10 @@ let files = [];
 /** The one place this document builds a sprite icon rather than writing one in
  *  the HTML — a <use> needs the SVG namespace, and createElement gives an
  *  unknown inline element that renders nothing. Same trap as math.js's mml(). */
-function spriteIcon(id) {
+function spriteIcon(id, state) {
   const NS = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(NS, "svg");
-  svg.setAttribute("class", "icon");
+  svg.setAttribute("class", state ? `icon ${state}` : "icon");
   svg.setAttribute("aria-hidden", "true");
   const use = document.createElementNS(NS, "use");
   use.setAttribute("href", id);
@@ -950,13 +1314,34 @@ promptEl.addEventListener("keydown", (event) => {
   const resume = event.ctrlKey || event.metaKey;
   // Only guarded for a fresh run — a ctrl+Enter with nothing to reply to falls
   // through to runTask, which says so rather than swallowing the keystroke.
-  if (!resume && runBtn.disabled) return;
   event.preventDefault();
+  // While a task runs, Enter talks to the agent instead of being ignored.
+  if (runBtn.disabled) return steer();
   runTask(resume);
 });
 
-const stored = await chrome.storage.local.get(["model", "mode", "sessions"]);
-if (stored.model) modelEl.value = stored.model;
+const stored = await chrome.storage.local.get(["model", "mode", "sessions", "fallbacks", "plan", "secondKey", "shownLane"]);
+const engines = initEngines(document.getElementById("engines"), modelEl, stored.fallbacks, (order) => {
+  fallbacks = order;
+  chrome.storage.local.set({ fallbacks });
+}, stored.secondKey, (on) => {
+  secondKey = on;
+  chrome.storage.local.set({ secondKey });
+});
+fallbacks = engines.order();
+secondKey = engines.secondKey();
+if (typeof stored.plan === "string") planRaw = planEl.value = stored.plan;
+planEl.addEventListener("input", () => {
+  planRaw = planEl.value;
+  chrome.storage.local.set({ plan: planRaw });
+  showMode();
+});
+// send() already says "not connected" when there is no bridge to ask.
+document.getElementById("audit-export").addEventListener("click", () => send({ type: "audit", run: shown.id }));
+// Only a model the dropdown still offers. Assigning one it does not (`sonnet`,
+// from before the ids were spelled out) leaves the <select> on no option at all,
+// so every Run would send "" and be refused as an unknown model.
+if ([...modelEl.options].some((option) => option.value === stored.model)) modelEl.value = stored.model;
 if (stored.mode) modeEl.value = stored.mode;
 // The Profile pane was removed with P11a's read_file: the agent reads the real
 // resume through the allow-list, so a second copy pasted into the panel was
@@ -967,11 +1352,13 @@ showMode();
 // Before the first note, so the greeting does not land on top of a transcript
 // that is being restored. Chrome tears this document down on every window
 // switch, so "restore what was here" is the common path, not the rare one.
-if (Array.isArray(stored.sessions) && stored.sessions.length) sessions = stored.sessions;
-// No greeting note on an empty session: the empty state below the header says
-// the same thing with three tasks you can actually click, and the note used to
-// hide it on the way past.
-if (sessions[0].entries.length) ui.restore(sessions[0].entries.slice());
-drawHistory();
+// No greeting note on an empty session: the empty state says the same thing
+// with three tasks you can actually click.
+sessions = Array.isArray(stored.sessions) && stored.sessions.length ? stored.sessions : [fresh()];
+// Sessions from before lanes have no id, and their live one was sessions[0].
+for (const session of sessions) session.id ??= newId();
+if (!sessions.some((session) => session.open)) sessions[0].open = true;
+for (const session of sessions.filter((s) => s.open)) await openLane(session);
+showLane(lanes.find((lane) => lane.id === stored.shownLane) ?? lanes[0]);
 
 connect();

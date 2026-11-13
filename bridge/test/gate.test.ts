@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { delta, serialize, UNCHANGED } from "../../extension/ax.js";
-import { check, remember, labelFor, rememberApproval, resetApprovals } from "../src/gate.ts";
+import { remember, labelFor } from "../src/page.ts";
+import { check, reads, rememberApproval, resetApprovals } from "../src/gate.ts";
 import { askPanel, setPanel, dropPanel, panelConnected, settle, settleGate } from "../src/relay.ts";
 import { relay } from "../src/mcp.ts";
 
@@ -90,12 +91,17 @@ test("an approved click is released to the panel", async () => {
 
   const result = relay("click", { ref: submitRef });
   await flush();
+  // The gate decides on the element as it is now, read first (mcp.ts readFor).
+  const read = panel.sent.find((m) => m.name === "label");
+  assert.ok(read, "the click was weighed without reading what it lands on");
+  settle({ id: read.id as number, ok: true, value: '[button] "Submit Application"' });
+  await flush();
   const gate = panel.sent.find((m) => m.type === "gate");
   assert.ok(gate, "the click was relayed without ever asking");
 
   settleGate({ id: gate.id as number, approved: true });
   await flush();
-  const call = panel.sent.find((m) => m.type === "tool");
+  const call = panel.sent.find((m) => m.type === "tool" && m.name === "click");
   assert.ok(call, "approval did not release the click");
 
   settle({ id: call.id as number, ok: true, value: '@f0e1 [heading] "Thanks"' });
@@ -193,9 +199,9 @@ test("in watch, an approved tool stops re-asking for the rest of the task", () =
   remember(text);
   const [submitRef] = refs.keys();
   resetApprovals();
-  assert.ok(check("click", { ref: submitRef }, "watch"));
-  rememberApproval("click", { ref: submitRef });
-  assert.equal(check("click", { ref: submitRef }, "watch"), null);
+  assert.ok(check("type", { ref: submitRef }, "watch"));
+  rememberApproval("type", { ref: submitRef });
+  assert.equal(check("type", { ref: submitRef }, "watch"), null);
   resetApprovals();
 });
 
@@ -259,4 +265,19 @@ test("a control the delta removed stops being gated", () => {
   remember(serialize(page(), "f0").text);
   remember(`${UNCHANGED}\n- @f0e11 [button] "Submit Application"`);
   assert.equal(check("click", { ref: "@f0e11" }), null, "it is not on the page any more");
+});
+
+test("in watch, an approved tool is no weaker than normal: Submit and Enter still ask, from a fresh read", () => {
+  const { text, refs } = serialize(page(), "f0");
+  remember(text);
+  const [submitRef] = refs.keys();
+  resetApprovals();
+  assert.equal(reads("click", { ref: submitRef }, "watch"), null);
+  rememberApproval("click", { ref: submitRef });
+  rememberApproval("key", { name: "Enter" });
+  assert.equal(reads("click", { ref: submitRef }, "watch"), "ref");
+  assert.ok(check("click", { ref: submitRef }, "watch"));
+  assert.ok(check("key", { name: "Enter" }, "watch"));
+  assert.equal(check("key", { name: "Tab" }, "watch"), null);
+  resetApprovals();
 });

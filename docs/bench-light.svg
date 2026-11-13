@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="134" viewBox="0 0 880 134" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" role="img" aria-label="Endoplexity against Claude in Chrome on 30 Online-Mind2Web tasks, same CLI and model">
+<style>.bar{transform-box:fill-box;transform-origin:0 50%;animation:grow .9s cubic-bezier(.2,.8,.2,1) both}.val{animation:fade .4s ease-out both}@keyframes grow{from{transform:scaleX(0)}}@keyframes fade{from{opacity:0}}@media (prefers-reduced-motion:reduce){.bar,.val{animation:none}}</style>
+<rect width="880" height="134" fill="#ffffff"/>
+<rect x="0" y="60" width="10" height="10" rx="2" fill="#16804f"/>
+<text x="16" y="69" font-size="13" font-weight="600" fill="#1f2328">Endoplexity</text>
+<rect x="0" y="94" width="10" height="10" rx="2" fill="#6250d6"/>
+<text x="16" y="103" font-size="13" font-weight="600" fill="#1f2328">Claude in Chrome</text>
+<text x="140" y="18" font-size="13" font-weight="600" fill="#1f2328">Median time per task</text>
+<text x="140" y="35" font-size="11" fill="#59636e">20 both finished · lower wins</text>
+<line x1="140" y1="52" x2="140" y2="112" stroke="#d1d9e0" stroke-width="1"/>
+<path class="bar" style="animation-delay:0.00s" d="M140 58h96.2460365800602a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-96.2460365800602z" fill="#16804f"/>
+<text class="val" style="animation-delay:0.70s" x="246.2460365800602" y="69" font-size="12" font-weight="600" fill="#1f2328">31 s</text>
+<path class="bar" style="animation-delay:0.08s" d="M140 92h181.33333333333334a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-181.33333333333334z" fill="#6250d6"/>
+<text class="val" style="animation-delay:0.78s" x="331.33333333333337" y="103" font-size="12" font-weight="600" fill="#1f2328">57 s</text>
+<text x="389.33333333333337" y="18" font-size="13" font-weight="600" fill="#1f2328">Median tokens per task</text>
+<text x="389.33333333333337" y="35" font-size="11" fill="#59636e">20 both finished · lower wins</text>
+<line x1="389.33333333333337" y1="52" x2="389.33333333333337" y2="112" stroke="#d1d9e0" stroke-width="1"/>
+<path class="bar" style="animation-delay:0.15s" d="M389.33333333333337 58h152.37907277248308a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-152.37907277248308z" fill="#16804f"/>
+<text class="val" style="animation-delay:0.85s" x="551.7124061058164" y="69" font-size="12" font-weight="600" fill="#1f2328">239k</text>
+<path class="bar" style="animation-delay:0.23s" d="M389.33333333333337 92h181.33333333333334a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-181.33333333333334z" fill="#6250d6"/>
+<text class="val" style="animation-delay:0.93s" x="580.6666666666667" y="103" font-size="12" font-weight="600" fill="#1f2328">283k</text>
+<text x="638.6666666666667" y="18" font-size="13" font-weight="600" fill="#1f2328">Median cost per task</text>
+<text x="638.6666666666667" y="35" font-size="11" fill="#59636e">20 both finished · API price</text>
+<line x1="638.6666666666667" y1="52" x2="638.6666666666667" y2="112" stroke="#d1d9e0" stroke-width="1"/>
+<path class="bar" style="animation-delay:0.30s" d="M638.6666666666667 58h144.75322803685373a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-144.75322803685373z" fill="#16804f"/>
+<text class="val" style="animation-delay:1.00s" x="793.4198947035204" y="69" font-size="12" font-weight="600" fill="#1f2328">$0.23</text>
+<path class="bar" style="animation-delay:0.38s" d="M638.6666666666667 92h181.33333333333334a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-181.33333333333334z" fill="#6250d6"/>
+<text class="val" style="animation-delay:1.08s" x="830.0000000000001" y="103" font-size="12" font-weight="600" fill="#1f2328">$0.29</text>
+</svg>

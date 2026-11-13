@@ -70,7 +70,7 @@ function add(node) {
   // one — which hid the empty state before anybody could read it. Measured in
   // headless: on a first run the invitation and its three example tasks
   // rendered and vanished in the same frame.
-  if (!node.classList?.contains("note")) chatEl.querySelector("#empty")?.classList.add("gone");
+  if (!node.classList?.contains("note")) chatEl.querySelector(".empty")?.classList.add("gone");
   const atBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 60;
   chatEl.appendChild(node);
   if (atBottom) chatEl.scrollTop = chatEl.scrollHeight;
@@ -247,11 +247,18 @@ export function gateSettled(approved) {
  * pasted into a bug report, and it is the only way to tell a run whose tools
  * were missing from one that faked its tool calls as text — so it takes every
  * message received, including the ones the conversation view drops.
+ *
+ * Appended as a node, never `textContent +=`: that re-wrote the whole log on
+ * every message, and a log of fifteen runs (761k characters) cost 118 ms of
+ * the panel's one thread per message. Every lane's tool calls wait on that
+ * thread, so with two runs going they took turns (measured, Phase 21).
  */
 export function raw(line) {
   if (!rawEl) return;
-  rawEl.textContent += `${new Date().toLocaleTimeString()}  ${line}\n`;
-  rawEl.scrollTop = rawEl.scrollHeight;
+  rawEl.append(`${new Date().toLocaleTimeString()}  ${line}\n`);
+  // Reading scrollHeight lays the log out, ~5 ms at that size even folded
+  // away. Followed only while it is open; the panel scrolls it on opening.
+  if (rawEl.closest("details")?.open) rawEl.scrollTop = rawEl.scrollHeight;
 }
 
 export function clear() {
@@ -259,8 +266,8 @@ export function clear() {
   if (chatEl) {
     // Everything except the empty state, which is markup from panel.html with
     // listeners already bound to it — replaceChildren() would take it too.
-    for (const node of [...chatEl.children]) if (node.id !== "empty") node.remove();
-    chatEl.querySelector("#empty")?.classList.remove("gone");
+    for (const node of [...chatEl.children]) if (!node.classList.contains("empty")) node.remove();
+    chatEl.querySelector(".empty")?.classList.remove("gone");
   }
   gateEl = null;
   gateEntry = null;

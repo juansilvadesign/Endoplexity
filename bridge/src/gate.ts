@@ -13,61 +13,8 @@
  * extra round trip to the panel to ask "what does this ref point at".
  */
 
-import { UNCHANGED } from "../../extension/ax.js";
-
-// One actionable line out of serialize(): "@ref [role] "name"", optionally
-// followed by a value or flags this policy does not need.
-const LINE = /^\s*(@\S+)\s+(\[[a-zA-Z]+\]\s+"[^"]*")/;
-
-let labels = new Map<string, string>();
-
-/**
- * Parse relayed page text and replace the ref -> label map wholesale. Refs
- * are per-page — cdp.js mints a fresh generation on every snapshot and
- * invalidates the last one — so there is nothing to merge in.
- *
- * Text with no ref lines is not a page at all: it's an ack like
- * "typed 4 characters into @f0e8" (tools.js's `type` return). Leaving the
- * map untouched in that case means a mid-form `type` call doesn't blind the
- * gate to the buttons the last real snapshot found.
- */
-export function remember(text: string): void {
-  // A delta names only what CHANGED, so replacing the map with one would blind
-  // the gate to every control that stayed put — and "Submit application" is
-  // precisely the thing that does not move while a form is being filled. Patch
-  // instead. Imported from ax.js rather than written out again here: this is
-  // the same "the gate depends on ax.js's line format" coupling the module
-  // already accepts, and a copy of the marker could drift silently into a gate
-  // that never fires.
-  if (text.startsWith(UNCHANGED)) {
-    for (const line of text.split("\n")) {
-      const sign = line[0];
-      if (sign !== "+" && sign !== "-") continue;
-      const m = LINE.exec(line.slice(1));
-      if (!m) continue;
-      // Removals come first in a delta, so a control whose label merely changed
-      // is deleted and re-added in that order rather than deleted afterwards.
-      if (sign === "+") labels.set(m[1], m[2]);
-      else labels.delete(m[1]);
-    }
-    return;
-  }
-  const found = new Map<string, string>();
-  for (const line of text.split("\n")) {
-    const m = LINE.exec(line);
-    if (m) found.set(m[1], m[2]);
-  }
-  if (found.size === 0) return;
-  labels = found;
-}
-
-// Look up a ref's label without gating anything, for the UI to render e.g.
-// `clicked "Submit application"` instead of a bare ref. Undefined for a
-// stale/unknown ref — same "not on the current page" case check() below
-// treats as nothing worth blocking on.
-export function labelFor(ref: string): string | undefined {
-  return labels.get(ref);
-}
+import { labelFor, controls } from "./page.ts";
+import { perRun } from "./run.ts";
 
 // ponytail: a label heuristic, not semantic understanding of the page — the
 // known ceiling. False positives ("Apply filters") prompt harmlessly, one
@@ -82,24 +29,30 @@ export function labelFor(ref: string): string | undefined {
 // control reads "I accept" (an EULA-style flow, no submit/confirm/etc next
 // to it) now goes ungated — the same class of false negative documented
 // above, just one word wider.
-const IRREVERSIBLE = /\b(submit|apply|pay|buy|purchase|order|checkout|confirm|delete|remove|send|book|sign up)\b/i;
+// Exported for the reflexes: Gate's lexical backend IS this regex, and a
+// control the bridge clicks on its own (a cookie banner) must never match it.
+export const IRREVERSIBLE = /\b(submit|apply|pay|buy|purchase|order|checkout|confirm|delete|remove|send|book|sign up)\b/i;
 
 export type Mode = "watch" | "normal" | "trust";
 
 // watch mode's whole rule: every mutating tool asks, every read is free.
-// Mirrors the tool list mcp.ts registers — the 4 reads (snapshot, tabs,
-// hover, scroll) are simply everything not in this set.
+// Mirrors the tool list mcp.ts registers — the reads (snapshot, tabs,
+// hover, scroll, find) are simply everything not in this set. batch never
+// reaches check() under its own name: each of its steps is checked as the
+// tool it names.
 const MUTATING = new Set(["click", "type", "key", "select", "upload", "navigate", "use_tab", "back", "forward"]);
 
 // watch-mode approval memory: once a tool kind is approved, stop asking for
 // the rest of the task — without this, watch asks on every keystroke and is
 // unusable. normal never touches this set; see check() below.
 // ponytail: keyed on tool name alone, not (tool, origin) as the ideal would
-// be — labels (the only page state gate.ts keeps) comes from serialize()
+// be — labels (the only page state the gate reads, kept in page.ts) come from serialize()
 // text and never carries an origin, and getting one means a new round trip
 // to the panel. Add per-origin scoping if a task that hops origins mid-run
 // turns out to need it.
-let approvedTools = new Set<string>();
+//
+// Per run (run.ts), with the plan below: approvals never cross between runs.
+const S = perRun(() => ({ approvedTools: new Set<string>(), plan: [] as string[], drawn: [] as string[] }));
 
 /**
  * Record that the human approved this kind of interaction, so watch mode
@@ -111,22 +64,80 @@ let approvedTools = new Set<string>();
  */
 export function rememberApproval(name: string, args?: Record<string, unknown>): void {
   void args;
-  approvedTools.add(name);
+  S().approvedTools.add(name);
 }
 
 // Clear the approval memory. Call at the start of every new task — one run's
 // "yes, always" answers must not leak into the next.
 export function resetApprovals(): void {
-  approvedTools = new Set();
+  S().approvedTools = new Set();
+}
+
+/**
+ * The plan lock (Phase 20): the sites this run may act on, as the user listed
+ * them with the task, and the hosts they approved since. Empty is no lock.
+ * Enforced here, in every mode including trust, where Claude in Chrome's
+ * `update_plan` is a screen the model is trusted to respect.
+ */
+
+/** The panel's list as hosts: scheme, path, port, `*.` and `www.` dropped. Untrusted, so capped. */
+export function cleanPlan(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const hosts = raw.flatMap((entry) => {
+    if (typeof entry !== "string" || !entry.trim()) return [];
+    const host = hostOf(/^[a-z][a-z0-9+.-]*:\/\//i.test(entry.trim()) ? entry.trim() : `http://${entry.trim()}`);
+    return host ? [host.replace(/^(\*\.|www\.)/, "")] : [];
+  });
+  // a non-empty list that sanitizes to nothing must not mean "no lock": use a host nothing matches
+  if (!hosts.length && raw.length) return ["(invalid plan)"];
+  return [...new Set(hosts)].slice(0, 20);
+}
+
+// The list as the user drew it, kept apart for the audit: a host approved
+// mid-run is the human's call on that run, not part of the plan they wrote.
+export const setPlan = (raw: unknown) => void (S().plan = S().drawn = cleanPlan(raw));
+export const planOf = () => ({ drawn: S().drawn, approved: S().plan.filter((host) => !S().drawn.includes(host)) });
+/** The human approved acting on `host`: it stays allowed for the rest of the task. */
+export const allowHost = (host: string) => void (S().plan = S().plan.length && host ? [...S().plan, host] : S().plan);
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/\.$/, "");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Does this call leave the plan? Checked against where it goes for a navigate
+ * or a new tab, and against the tab it acts on for everything else that acts,
+ * which is how a link click that left the plan is caught: its page can be read,
+ * and nothing on it is done unasked. back, forward and a plain tab switch go
+ * somewhere the bridge cannot know beforehand, so the action after them is
+ * what gets checked. `here` is the tab's URL now, "" if it could not be read,
+ * which asks: not knowing the site is not knowing it is allowed.
+ *
+ * Returns the prompt, its reason alone (for a call the gate asks about anyway)
+ * and the host an approval allows; or null.
+ */
+export function offPlan(name: string, args: Record<string, unknown>, here: string): { asked: string; why: string; host: string } | null {
+  const { plan } = S();
+  if (!plan.length || !MUTATING.has(name) || name === "back" || name === "forward") return null;
+  const moves = name === "navigate" || name === "use_tab";
+  if (moves && typeof args.url !== "string") return null;
+  const host = hostOf(moves ? String(args.url) : here);
+  if (host && plan.some((d) => host === d || host.endsWith(`.${d}`))) return null;
+  const why = `${host || "a site that could not be read"} is outside this run's plan (${plan.join(", ")})`;
+  return { asked: `${describe(name, args, undefined)} — ${why}`, why, host };
 }
 
 // watch-mode prompt text for a mutating call, once no gate-worthy label is
 // available to quote (either the tool has no ref, or the ref's label is
 // unremarkable) — plain and honest rather than borrowing normal mode's
 // "reads as irreversible" framing, which does not apply here.
-function describe(name: string, args: Record<string, unknown>): string {
+function describe(name: string, args: Record<string, unknown>, labels: ReadonlyMap<string, string> | undefined): string {
   const ref = typeof args.ref === "string" ? args.ref : undefined;
-  const label = ref && labels.get(ref);
+  const label = ref && (labels ? labels.get(ref) : labelFor(ref));
   if (label) return `${name} ${ref} ${label}`;
   switch (name) {
     case "click":
@@ -153,6 +164,27 @@ function describe(name: string, args: Record<string, unknown>): string {
 }
 
 /**
+ * What deciding this call needs read fresh from the panel first: "ref" is the
+ * clicked element's label as it is now, "page" every label on the page now,
+ * null nothing.
+ *
+ * Not trusting page.ts's copy for these is the Phase 15 review's lesson. The
+ * copy is the page as the model last read it, and three ways it differs from
+ * the page an action lands on each let a click on Submit through unasked: a
+ * quiet batch step moved the page, a `from:` window or delta left a ref out,
+ * and a label kept from an earlier window went stale. Guessing when the copy
+ * is stale missed a case each time; reading costs one CDP call for a click.
+ * Only normal mode weighs labels: trust weighs nothing, watch weighs the tool.
+ */
+export function reads(name: string, args: Record<string, unknown>, mode?: Mode): "ref" | "page" | null {
+  // watch weighs the tool only until it is approved; after that the normal rules apply
+  if (mode === "trust" || (mode === "watch" && !S().approvedTools.has(name))) return null;
+  if (name === "click" && typeof args.ref === "string") return "ref";
+  if (name === "key" && args.name === "Enter") return "page";
+  return null;
+}
+
+/**
  * Does this tool call need a human? Depends on the mode the panel set for
  * this task — the model never sees or sets `mode`, only the bridge passes
  * it through from the panel:
@@ -167,16 +199,29 @@ function describe(name: string, args: Record<string, unknown>): string {
  * mode string runs this branch, never "trust" — a bad mode value must fail
  * closed, not open.
  *
+ * `fresh` is what reads() asked the panel for, read just now: the labels to
+ * decide on instead of page.ts's copy. `null` means that read failed, and a
+ * decision that needed it asks rather than guessing (fails closed).
+ *
  * Returns a one-line description for the approval prompt, or null to let it
  * run.
  */
-export function check(name: string, args: Record<string, unknown>, mode?: Mode): string | null {
+export function check(
+  name: string,
+  args: Record<string, unknown>,
+  mode?: Mode,
+  fresh?: ReadonlyMap<string, string> | null,
+): string | null {
   if (mode === "trust") return null;
 
   if (mode === "watch") {
     if (!MUTATING.has(name)) return null;
-    if (approvedTools.has(name)) return null;
-    return describe(name, args);
+    // once approved, fall through: "always" must not be weaker than normal mode
+    if (!S().approvedTools.has(name)) return describe(name, args, fresh ?? undefined);
+  }
+
+  if (fresh === null && reads(name, args, mode)) {
+    return `${describe(name, args, undefined)} — the page could not be read to check what this is`;
   }
 
   // "normal", and the fallback for anything that isn't exactly "watch" or
@@ -194,7 +239,7 @@ export function check(name: string, args: Record<string, unknown>, mode?: Mode):
     // ponytail: page-level heuristic, not focus tracking — the known ceiling
     // is a page that mixes a submit button with an unrelated search box,
     // which over-gates. Add real focus tracking if that turns out to matter.
-    for (const [ref, label] of labels) {
+    for (const [ref, label] of fresh ?? controls()) {
       if (IRREVERSIBLE.test(label)) return `press Enter — this page has ${ref} ${label}`;
     }
     return null;
@@ -203,8 +248,9 @@ export function check(name: string, args: Record<string, unknown>, mode?: Mode):
   if (name !== "click") return null;
   const ref = args.ref;
   if (typeof ref !== "string") return null;
-  const label = labels.get(ref);
-  // Not in the map: the ref is stale or never existed. The panel is about to
+  const label = fresh ? fresh.get(ref) : labelFor(ref);
+  // Not in the map: the ref is stale or never existed (the fresh read came
+  // back "unknown ref", or the copy never had it). The panel is about to
   // reject it with "unknown/stale ref" on its own, so gating it buys
   // nothing and just trains the human to rubber-stamp the prompt.
   if (!label) return null;

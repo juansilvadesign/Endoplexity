@@ -48,7 +48,8 @@ const FLAGS = new Set(["required", "disabled", "checked", "expanded", "selected"
 // action returns the page, one such node on the page breaks every tool call.
 // ponytail: String() also stringifies nodeList/idref values to "[object Object]".
 // Ugly, never fatal — give those a real rendering when a page needs it.
-const clean = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+// double quotes become single: the line grammar (page.ts LINE) ends a name at the first one
+const clean = (s) => String(s ?? "").replace(/"/g, "'").replace(/\s+/g, " ").trim();
 
 function flagsOf(node) {
   const on = [];
@@ -67,6 +68,16 @@ function valueOf(node) {
   const v = clean(node.value?.value);
   if (!v) return "";
   return ` = "${v.length > 80 ? `${v.slice(0, 80)}…` : v}"`;
+}
+
+/**
+ * `[role] "name"`, the part of a line that says what a control is. Shared with
+ * cdp.js labelOf(), so the gate's fresh read of one element and the page the
+ * model reads cannot drift into two spellings of the same button.
+ */
+export function labelOf(node) {
+  const name = clean(node.name?.value);
+  return `[${node.role?.value ?? ""}]${name ? ` "${name}"` : ""}`;
 }
 
 /**
@@ -117,7 +128,7 @@ export function serialize(nodes, frame, { maxLines = 300, full = false, from = 0
       // A node with no backend id cannot be acted on either way; it used to get
       // a ref that could only ever answer "unknown ref".
       if (ref) refs.set(ref, id);
-      emit(`${ref && `${ref} `}[${role}]${name ? ` "${name}"` : ""}${valueOf(node)}${flagsOf(node)}`, depth);
+      emit(`${ref && `${ref} `}${labelOf(node)}${valueOf(node)}${flagsOf(node)}`, depth);
       childDepth = depth + 1;
       childAnnounced = name;
     } else if (PROSE.has(role) && (full || LEAN_PROSE.has(role)) && name && name !== announced) {
